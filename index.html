@@ -1073,11 +1073,11 @@
                 <span>Official Student Gmail *</span>
                 <span style="font-size: 0.72rem; color: var(--brand-gold); margin-left: 0.35rem;">(Admin-Confidential)</span>
               </label>
-              <span id="email-verify-status" style="font-size: 0.76rem; color: #19D68C; font-weight: 600;">⚡ Instant Pass Generation Active</span>
+              <span id="email-verify-status" style="font-size: 0.76rem; color: #19D68C; font-weight: 600;">🔐 Gmail OTP required for new passes</span>
             </div>
             
             <div style="display: flex; gap: 0.5rem; align-items: center;">
-              <input type="email" id="member-email" class="form-input" placeholder="e.g. yourname@gmail.com (Optional)" style="flex: 1;">
+              <input type="email" id="member-email" class="form-input" placeholder="e.g. yourname@gmail.com (required for new passes)" style="flex: 1;">
               <button type="button" id="btn-send-otp" class="btn-secondary" onclick="sendGmailOtp()" style="padding: 0.5rem 0.95rem; font-size: 0.8rem; white-space: nowrap;">
                 <span>Send OTP ✉️</span>
               </button>
@@ -1323,7 +1323,7 @@
         </p>
 
         <div style="max-width: 320px; margin: 0 auto;">
-          <input type="password" id="admin-pin-input" class="form-input" placeholder="Enter PIN (e.g. admin2026)" style="text-align: center; font-family: var(--font-mono); font-size: 1.1rem; letter-spacing: 0.1em; margin-bottom: 1rem;">
+          <input type="password" id="admin-pin-input" class="form-input" placeholder="Enter the configured administrator PIN" style="text-align: center; font-family: var(--font-mono); font-size: 1.1rem; letter-spacing: 0.1em; margin-bottom: 1rem;">
           <button type="button" class="btn-primary" onclick="submitAdminPin()" style="width: 100%; justify-content: center; padding: 0.75rem;">
             <span>UNLOCK ADMIN SUITE</span>
             <span>🔓</span>
@@ -1522,7 +1522,7 @@
               <span id="smtp-status-indicator" style="width: 12px; height: 12px; border-radius: 50%; background: #ff9800; display: inline-block;"></span>
               <div>
                 <strong id="smtp-status-title" style="color: #ffffff; font-size: 0.95rem;">Checking SMTP Mailer Status...</strong>
-                <div id="smtp-status-subtitle" style="font-size: 0.8rem; color: var(--color-text-muted);">Loading configuration from SQLite &amp; environment...</div>
+                <div id="smtp-status-subtitle" style="font-size: 0.8rem; color: var(--color-text-muted);">Loading server environment status...</div>
               </div>
             </div>
             <button type="button" class="btn-outline-small" onclick="loadAdminSmtpConfig()">
@@ -1531,49 +1531,20 @@
           </div>
 
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem;">
-            <!-- Column 1: SMTP Credentials Form -->
+            <!-- Column 1: Server-side SMTP configuration instructions -->
             <div style="background: rgba(8, 10, 15, 0.6); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: var(--radius-md); padding: 1.5rem;">
-              <h4 style="color: #ffffff; font-size: 1.05rem; margin-bottom: 0.4rem;">⚙️ Gmail SMTP Credentials</h4>
-              <p style="color: var(--color-text-muted); font-size: 0.82rem; margin-bottom: 1.25rem; line-height: 1.5;">
-                Configure the sender Google account that automatically dispatches real OTP codes to student Gmail addresses.
+              <h4 style="color: #ffffff; font-size: 1.05rem; margin-bottom: 0.4rem;">⚙️ Server-side Gmail SMTP</h4>
+              <p style="color: var(--color-text-muted); font-size: 0.82rem; margin-bottom: 1rem; line-height: 1.5;">
+                SMTP credentials are read only from the backend environment. They are never sent to or stored by this browser.
               </p>
-
-              <form onsubmit="saveAdminSmtpConfig(event)">
-                <div class="form-group" style="margin-bottom: 0.85rem;">
-                  <label class="form-label">Sender Gmail Address *</label>
-                  <input type="email" id="smtp-config-user" class="form-input" placeholder="e.g. your_college_email@gmail.com" required>
-                </div>
-
-                <div class="form-group" style="margin-bottom: 0.85rem;">
-                  <label class="form-label" style="display: flex; justify-content: space-between;">
-                    <span>16-Character Google App Password *</span>
-                    <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color: var(--brand-gold); font-size: 0.75rem; text-decoration: underline;">Generate in Google</a>
-                  </label>
-                  <input type="password" id="smtp-config-pass" class="form-input" placeholder="e.g. abcd efgh ijkl mnop" required>
-                  <small style="color: var(--color-text-muted); font-size: 0.72rem;">Spaces are automatically stripped. Never use your main account password.</small>
-                </div>
-
-                <div class="form-group-grid" style="margin-bottom: 0.85rem;">
-                  <div class="form-group" style="margin-bottom: 0;">
-                    <label class="form-label">SMTP Host</label>
-                    <input type="text" id="smtp-config-host" class="form-input" value="smtp.gmail.com" required>
-                  </div>
-                  <div class="form-group" style="margin-bottom: 0;">
-                    <label class="form-label">SMTP Port (TLS)</label>
-                    <input type="number" id="smtp-config-port" class="form-input" value="587" required>
-                  </div>
-                </div>
-
-                <div class="form-group" style="margin-bottom: 1.25rem;">
-                  <label class="form-label">Sender Display Name</label>
-                  <input type="text" id="smtp-config-from" class="form-input" value="NKOCET Solapur Verification Gateway" required>
-                </div>
-
-                <button type="submit" id="btn-save-smtp" class="btn-primary" style="width: 100%; justify-content: center; padding: 0.65rem 1rem;">
-                  <span>Save SMTP Credentials 💾</span>
-                </button>
-                <div id="smtp-save-msg" style="display: none; font-size: 0.82rem; margin-top: 0.75rem; text-align: center;"></div>
-              </form>
+              <ol style="margin: 0; padding-left: 1.25rem; font-size: 0.82rem; color: var(--color-text-secondary); line-height: 1.7;">
+                <li>Set <code>SMTP_USER</code> and <code>SMTP_PASSWORD</code> in the server's ignored <code>.env</code> file.</li>
+                <li>Use a Google App Password, not your account password.</li>
+                <li>Restart the backend and refresh this status panel.</li>
+              </ol>
+              <p style="margin: 1rem 0 0; font-size: 0.78rem; color: var(--color-text-muted);">
+                SMTP credentials cannot be saved from this admin console.
+              </p>
             </div>
 
             <!-- Column 2: Live Test & 30-Second Setup Guide -->
@@ -1604,11 +1575,8 @@
                   <li>Click <strong>Security</strong> and confirm <strong>2-Step Verification</strong> is ON.</li>
                   <li>Go to <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color: var(--brand-gold);">Google App Passwords</a>.</li>
                   <li>Enter App Name: <code style="color:#ffffff;">NKOCET Website</code> and click <strong>Create</strong>.</li>
-                  <li>Copy the 16-letter code (e.g. <code style="color:#00e676;">abcd efgh ijkl mnop</code>) and paste it into the box on the left.</li>
+                  <li>Set the code in the server's ignored <code>.env</code> file and restart the backend.</li>
                 </ol>
-                <div style="margin-top: 0.75rem; font-size: 0.75rem; color: var(--color-text-muted);">
-                  💡 Credentials can also be placed directly in <code style="color:var(--brand-gold);">nkocet-website/.env</code>.
-                </div>
               </div>
             </div>
           </div>
@@ -1946,6 +1914,7 @@
   <div id="toast-container" aria-live="polite"></div>
 
   <!-- Core JavaScript -->
+  <script src="api-config.js"></script>
   <script src="main.js?v=20261101_v5"></script>
 </body>
 </html>

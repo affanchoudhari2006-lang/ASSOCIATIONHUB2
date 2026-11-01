@@ -18,6 +18,7 @@ Features:
 
 import os
 import sys
+import ipaddress
 import io
 import base64
 import sqlite3
@@ -29,10 +30,11 @@ import re
 import csv
 import time
 import smtplib
+from urllib.parse import urlsplit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Mapping
 from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response, Query, Header
@@ -55,9 +57,47 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 
 # Base Directory & Database Path
 DIRECTORY = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(DIRECTORY, "associationhub.db")
 
-# Zero-dependency .env loader for real SMTP credentials & secrets
+def resolve_database_path(environ: Optional[Mapping[str, str]] = None) -> str:
+    values = os.environ if environ is None else environ
+    return values.get("DATABASE_PATH", "").strip() or os.path.join(DIRECTORY, "associationhub.db")
+
+
+DB_PATH = resolve_database_path()
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").strip()
+
+
+def build_verification_url(pass_id: str, signature: str) -> str:
+    """Build a QR target from the explicitly configured public frontend URL."""
+    app_url = os.environ.get("PUBLIC_APP_URL", PUBLIC_APP_URL).strip().rstrip("/")
+    try:
+        parsed = urlsplit(app_url)
+        hostname = (parsed.hostname or "").lower()
+        try:
+            address = ipaddress.ip_address(hostname)
+            is_non_public_ip = address.is_private or address.is_loopback
+        except ValueError:
+            is_non_public_ip = False
+        valid_url = (
+            parsed.scheme == "https"
+            and bool(parsed.netloc)
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+            and hostname not in {"localhost", "localhost.localdomain"}
+            and not is_non_public_ip
+        )
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise HTTPException(
+            status_code=503,
+            detail="Public verification URL is not configured. Set PUBLIC_APP_URL to the HTTPS frontend base URL."
+        )
+    return f"{app_url}/verify.html?pass_id={pass_id}&sig={signature}"
+
+# Zero-dependency .env loader for local server configuration
 def load_dotenv_custom(filepath: Optional[str] = None):
     if filepath is None:
         filepath = os.path.join(DIRECTORY, ".env")
@@ -78,8 +118,65 @@ def load_dotenv_custom(filepath: Optional[str] = None):
 
 load_dotenv_custom()
 
-ADMIN_SECRET_PIN = os.environ.get("ADMIN_SECRET_PIN", "admin2026")
-NKOCET_CRYPTO_SECRET = os.environ.get("NKOCET_CRYPTO_SECRET", "nkocet_sec_2026_orchid_ledger_key_994a")
+def load_server_configuration(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """Load and validate secrets and optional SMTP settings without insecure defaults."""
+    values = os.environ if environ is None else environ
+    admin_pin = values.get("ADMIN_SECRET_PIN", "").strip()
+    crypto_secret = values.get("NKOCET_CRYPTO_SECRET", "").strip()
+    errors = []
+
+    def is_placeholder(value: str) -> bool:
+        normalized = value.casefold()
+        return any(marker in normalized for marker in (
+            "replace", "placeholder", "your_", "your-", "example", "<", ">"
+        ))
+
+    if not admin_pin:
+        errors.append("ADMIN_SECRET_PIN is required")
+    elif len(admin_pin) < 16 or is_placeholder(admin_pin):
+        errors.append("ADMIN_SECRET_PIN must be a non-placeholder value of at least 16 characters")
+
+    if not crypto_secret:
+        errors.append("NKOCET_CRYPTO_SECRET is required")
+    elif len(crypto_secret) < 64 or is_placeholder(crypto_secret):
+        errors.append("NKOCET_CRYPTO_SECRET must be a non-placeholder value of at least 64 characters")
+    elif hmac.compare_digest(admin_pin, crypto_secret):
+        errors.append("NKOCET_CRYPTO_SECRET must differ from ADMIN_SECRET_PIN")
+
+    smtp_user = values.get("SMTP_USER", "").strip()
+    smtp_password = values.get("SMTP_PASSWORD", "").strip()
+    if bool(smtp_user) != bool(smtp_password):
+        errors.append("SMTP_USER and SMTP_PASSWORD must either both be set or both be empty")
+    if smtp_user and is_placeholder(smtp_user):
+        errors.append("SMTP_USER must be a real sender account, not a placeholder")
+    if smtp_password and is_placeholder(smtp_password):
+        errors.append("SMTP_PASSWORD must be a real app password, not a placeholder")
+
+    try:
+        smtp_port = int(values.get("SMTP_PORT", "587"))
+        if not 1 <= smtp_port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append("SMTP_PORT must be an integer from 1 to 65535")
+        smtp_port = 587
+
+    if errors:
+        raise ValueError("Invalid server configuration: " + "; ".join(errors))
+
+    return {
+        "admin_pin": admin_pin,
+        "crypto_secret": crypto_secret,
+        "smtp_user": smtp_user,
+        "smtp_password": smtp_password,
+        "smtp_host": values.get("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com",
+        "smtp_port": smtp_port,
+        "smtp_from_name": values.get("SMTP_FROM_NAME", "NKOCET Solapur Verification Gateway").strip()
+            or "NKOCET Solapur Verification Gateway",
+    }
+
+
+ADMIN_SECRET_PIN = os.environ.get("ADMIN_SECRET_PIN", "").strip()
+NKOCET_CRYPTO_SECRET = os.environ.get("NKOCET_CRYPTO_SECRET", "").strip()
 
 ALLOWED_ASSOCIATIONS = {"CSESA", "MESA", "EESA", "CESA", "AEXS", "AIESA"}
 ALLOWED_YEARS = {"First Year (FY)", "Second Year (SY)", "Third Year (TY)", "Final Year (B.Tech)"}
@@ -99,10 +196,60 @@ BLOCKED_KEYWORDS = {
 
 def get_client_ip(request: Request) -> str:
     """Safely extracts client IP address."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
+    peer = request.client.host if request.client else "127.0.0.1"
+    try:
+        peer_address = ipaddress.ip_address(peer)
+    except ValueError:
+        return "127.0.0.1"
+
+    trusted_proxy_ips = {
+        value.strip()
+        for value in os.environ.get("TRUSTED_PROXY_IPS", "").split(",")
+        if value.strip()
+    }
+    peer_is_trusted = peer_address.is_loopback
+    for configured_proxy in trusted_proxy_ips:
+        try:
+            if peer_address in ipaddress.ip_network(configured_proxy, strict=False):
+                peer_is_trusted = True
+                break
+        except ValueError:
+            continue
+    if os.environ.get("RENDER", "").strip() == "true" and peer_address.is_private:
+        peer_is_trusted = True
+    if not peer_is_trusted:
+        return peer
+
+    candidates = [
+        value.strip()
+        for value in request.headers.get("X-Forwarded-For", "").split(",")
+        if value.strip()
+    ]
+    while candidates:
+        candidate = candidates[-1]
+        try:
+            candidate_address = ipaddress.ip_address(candidate)
+        except ValueError:
+            candidates.pop()
+            continue
+        candidate_is_trusted = False
+        for proxy in trusted_proxy_ips:
+            try:
+                if candidate_address in ipaddress.ip_network(proxy, strict=False):
+                    candidate_is_trusted = True
+                    break
+            except ValueError:
+                continue
+        if candidate_is_trusted:
+            candidates.pop()
+            continue
+        return str(candidate_address)
+
+    render_client_ip = request.headers.get("Render-Client-IP", "").strip()
+    try:
+        return str(ipaddress.ip_address(render_client_ip))
+    except ValueError:
+        return peer
 
 def compute_hmac_signature(pass_id: str, roll_no: str, association: str) -> str:
     """Computes a 16-character cryptographic HMAC-SHA256 signature for pass integrity."""
@@ -110,25 +257,45 @@ def compute_hmac_signature(pass_id: str, roll_no: str, association: str) -> str:
     return hmac.new(NKOCET_CRYPTO_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16].upper()
 
 def create_admin_session_token() -> str:
-    """Creates a time-bound HMAC signed administrator session token valid for 3 hours."""
+    """Creates a persistent, time-bound administrator session token."""
     timestamp = int(datetime.now().timestamp())
-    data = f"ADMIN:{timestamp}"
+    session_id = secrets.token_urlsafe(32)
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO admin_sessions (session_id, expires_at, revoked_at, created_at)
+            VALUES (?, ?, NULL, ?);
+        """, (session_id, timestamp + 10800, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    data = f"ADMIN:{timestamp}:{session_id}"
     sig = hmac.new(NKOCET_CRYPTO_SECRET.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
-    return f"SESSION.{timestamp}.{sig}"
+    return f"SESSION.{timestamp}.{session_id}.{sig}"
 
 def verify_admin_session_token(token: str) -> bool:
-    """Validates an admin session token signature and checks if within 3 hours."""
+    """Validates signature, server-side expiry, and revocation state."""
     try:
         parts = token.split(".")
-        if len(parts) != 3 or parts[0] != "SESSION":
+        if len(parts) != 4 or parts[0] != "SESSION":
             return False
         timestamp = int(parts[1])
-        provided_sig = parts[2]
+        session_id = parts[2]
+        provided_sig = parts[3]
         now = int(datetime.now().timestamp())
-        if now - timestamp > 10800 or timestamp > now + 300: # 3 hours
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", session_id):
             return False
-        expected_sig = hmac.new(NKOCET_CRYPTO_SECRET.encode("utf-8"), f"ADMIN:{timestamp}".encode("utf-8"), hashlib.sha256).hexdigest()[:24]
-        return hmac.compare_digest(expected_sig, provided_sig)
+        if now - timestamp > 10800 or timestamp > now + 300:
+            return False
+        expected_sig = hmac.new(
+            NKOCET_CRYPTO_SECRET.encode("utf-8"),
+            f"ADMIN:{timestamp}:{session_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:24]
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            return False
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT expires_at, revoked_at FROM admin_sessions WHERE session_id = ?;",
+                (session_id,),
+            ).fetchone()
+        return bool(row and float(row["expires_at"]) > now and row["revoked_at"] is None)
     except Exception:
         return False
 
@@ -162,22 +329,28 @@ def hash_student_password(password: str, salt: Optional[str] = None) -> Tuple[st
     return pwd_hash, salt
 
 def check_admin_brute_force(ip: str):
-    """Enforces lockout after 5 failed PIN attempts within 10 minutes."""
+    """Enforces persistent lockout after 5 failed PIN attempts within 15 minutes."""
     now = datetime.now()
-    cutoff = now - timedelta(minutes=10)
-    attempts = [t for t in _admin_failed_attempts.get(ip, []) if t > cutoff]
-    if len(attempts) >= 5:
+    cutoff = now.timestamp() - 15 * 60
+    with get_db() as conn:
+        count = conn.execute("""
+            SELECT COUNT(*) FROM admin_failed_attempts WHERE ip_address = ? AND attempted_at > ?;
+        """, (ip, cutoff)).fetchone()[0]
+    if count >= 5:
         raise HTTPException(
             status_code=429,
             detail="Too many failed PIN attempts. Admin console is locked for 15 minutes to prevent brute-force attacks."
         )
 
 def record_admin_failed_attempt(ip: str):
-    now = datetime.now()
-    cutoff = now - timedelta(minutes=10)
-    attempts = [t for t in _admin_failed_attempts.get(ip, []) if t > cutoff]
-    attempts.append(now)
-    _admin_failed_attempts[ip] = attempts
+    now = datetime.now().timestamp()
+    cutoff = now - 15 * 60
+    with get_db() as conn:
+        conn.execute("DELETE FROM admin_failed_attempts WHERE attempted_at <= ?;", (cutoff,))
+        conn.execute(
+            "INSERT INTO admin_failed_attempts (ip_address, attempted_at) VALUES (?, ?);",
+            (ip, now),
+        )
 
 def check_register_rate_limit(ip: str):
     """Prevents spam automated registrations: max 30 per 10 minutes per IP (60 for local testing & campus labs)."""
@@ -308,11 +481,7 @@ def verify_admin_access(request: Request):
         request.headers.get("X-Admin-Pin") or
         request.headers.get("x-admin-pin") or
         request.headers.get("X-Admin-Token") or 
-        request.headers.get("x-admin-token") or 
-        request.query_params.get("admin_key") or 
-        request.query_params.get("pin") or 
-        request.query_params.get("key") or 
-        request.query_params.get("token")
+        request.headers.get("x-admin-token")
     )
     auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
@@ -323,7 +492,7 @@ def verify_admin_access(request: Request):
             status_code=403,
             detail="Forbidden: Invalid or missing Administrator Security Key."
         )
-    if key == ADMIN_SECRET_PIN or verify_admin_session_token(key):
+    if hmac.compare_digest(key.encode("utf-8"), ADMIN_SECRET_PIN.encode("utf-8")) or verify_admin_session_token(key):
         return True
     
     raise HTTPException(
@@ -356,6 +525,7 @@ def log_audit_event(event_type: str, actor_ip: str, details: str, conn: Optional
 @contextmanager
 def get_db():
     """Safe context manager with WAL mode and generous busy timeout."""
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=20.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -407,6 +577,26 @@ def init_db():
         if "email" not in cols:
             cursor.execute("ALTER TABLE memberships ADD COLUMN email TEXT;")
 
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+            session_id TEXT PRIMARY KEY,
+            expires_at REAL NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admin_failed_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            attempted_at REAL NOT NULL
+        );
+        """)
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_admin_failed_attempt_ip_time
+        ON admin_failed_attempts (ip_address, attempted_at);
+        """)
+
         # 1.5. Email OTP Verifications Table (5-min expiry, 60s cooldown, SHA-256 hashed OTP)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS email_otp_verifications (
@@ -414,6 +604,8 @@ def init_db():
             otp_hash TEXT,
             otp_code TEXT,
             roll_no TEXT,
+            association TEXT,
+            session_id TEXT,
             expires_at REAL NOT NULL,
             last_sent_at REAL DEFAULT 0,
             attempts INTEGER DEFAULT 0,
@@ -431,6 +623,10 @@ def init_db():
             cursor.execute("ALTER TABLE email_otp_verifications ADD COLUMN last_sent_at REAL DEFAULT 0;")
         if "verified_at" not in ev_cols:
             cursor.execute("ALTER TABLE email_otp_verifications ADD COLUMN verified_at TEXT;")
+        if "association" not in ev_cols:
+            cursor.execute("ALTER TABLE email_otp_verifications ADD COLUMN association TEXT;")
+        if "session_id" not in ev_cols:
+            cursor.execute("ALTER TABLE email_otp_verifications ADD COLUMN session_id TEXT;")
 
         # 1.6. Registered Students Table (Complete Student Registration Gate)
         cursor.execute("""
@@ -493,14 +689,16 @@ def init_db():
         ]
         for pid, sname, sroll, semail, sdept, syr, sassoc, sint in seed_members:
             sig = compute_hmac_signature(pid, sroll, sassoc)
-            qr_url = f"http://127.0.0.1:8080/verify.html?pass_id={pid}&sig={sig}"
-            qr_b64 = make_qr_base64(qr_url)
+            qr_b64 = ""
             cursor.execute("""
             INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, '2026-10-25 10:00:00');
             """, (pid, sname, sroll, semail, sdept, syr, sassoc, sint, qr_b64, sig))
             # Also backfill signature and email if missing
-            cursor.execute("UPDATE memberships SET crypto_signature = ?, email = COALESCE(email, ?) WHERE pass_id = ?;", (sig, semail, pid))
+            cursor.execute(
+                "UPDATE memberships SET crypto_signature = COALESCE(crypto_signature, ?), email = COALESCE(email, ?) WHERE pass_id = ?;",
+                (sig, semail, pid)
+            )
 
         # 2. Gated Community Chat Users Table
         cursor.execute("""
@@ -512,9 +710,30 @@ def init_db():
             dept TEXT NOT NULL,
             status TEXT DEFAULT 'ACTIVE',
             session_token TEXT,
+            session_expires_at TEXT,
+            session_revoked_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             last_active TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        """)
+        cursor.execute("PRAGMA table_info(community_users);")
+        chat_cols = [r[1] for r in cursor.fetchall()]
+        if "session_expires_at" not in chat_cols:
+            cursor.execute("ALTER TABLE community_users ADD COLUMN session_expires_at TEXT;")
+        if "session_revoked_at" not in chat_cols:
+            cursor.execute("ALTER TABLE community_users ADD COLUMN session_revoked_at TEXT;")
+        cursor.execute("""
+        UPDATE community_users
+        SET session_expires_at = datetime(created_at, '+24 hours')
+        WHERE session_token IS NOT NULL AND session_expires_at IS NULL;
+        """)
+        cursor.execute("""
+        UPDATE community_users
+        SET session_revoked_at = CURRENT_TIMESTAMP,
+            session_token = NULL
+        WHERE status IN ('BANNED', 'SUSPENDED')
+          AND session_token IS NOT NULL
+          AND session_revoked_at IS NULL;
         """)
 
         # 3. Community Experience Posts Table
@@ -711,39 +930,20 @@ def init_db():
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        # Remove SMTP credentials persisted by older releases; configuration is env-only.
+        cursor.execute("DELETE FROM system_settings WHERE key LIKE 'smtp_%';")
 
 
 def get_smtp_config() -> Dict[str, Any]:
-    """Fetches SMTP credentials from SQLite settings first, then from environment."""
-    config = {
-        "user": os.environ.get("SMTP_USER", "").strip(),
-        "password": os.environ.get("SMTP_PASSWORD", "").strip(),
-        "host": os.environ.get("SMTP_HOST", "smtp.gmail.com").strip(),
-        "port": int(os.environ.get("SMTP_PORT", 587)),
-        "from_name": os.environ.get("SMTP_FROM_NAME", "NKOCET Solapur Verification Gateway").strip()
+    """Fetches SMTP configuration exclusively from validated environment settings."""
+    config = load_server_configuration()
+    return {
+        "user": config["smtp_user"],
+        "password": config["smtp_password"],
+        "host": config["smtp_host"],
+        "port": config["smtp_port"],
+        "from_name": config["smtp_from_name"],
     }
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT key, value FROM system_settings WHERE key LIKE 'smtp_%';")
-            rows = cursor.fetchall()
-            for r in rows:
-                if r["key"] == "smtp_user" and r["value"]:
-                    config["user"] = r["value"].strip()
-                elif r["key"] == "smtp_password" and r["value"]:
-                    config["password"] = r["value"].strip()
-                elif r["key"] == "smtp_host" and r["value"]:
-                    config["host"] = r["value"].strip()
-                elif r["key"] == "smtp_port" and r["value"]:
-                    try:
-                        config["port"] = int(r["value"])
-                    except Exception:
-                        pass
-                elif r["key"] == "smtp_from_name" and r["value"]:
-                    config["from_name"] = r["value"].strip()
-    except Exception as e:
-        print(f"[SMTP CONFIG FETCH ERROR] {e}")
-    return config
 
 
 def send_real_smtp_email(to_email: str, recipient_name: str, otp_code: str) -> Dict[str, Any]:
@@ -762,7 +962,7 @@ def send_real_smtp_email(to_email: str, recipient_name: str, otp_code: str) -> D
         return {
             "sent": False,
             "configured": False,
-            "reason": "SMTP credentials not provided. Set SMTP_USER and SMTP_PASSWORD in .env or Admin Console."
+            "reason": "SMTP credentials are not configured. Set SMTP_USER and SMTP_PASSWORD in the server environment."
         }
 
     clean_name = recipient_name.strip() if recipient_name else "Student"
@@ -778,7 +978,7 @@ Your official verification code for NK Orchid College of Engineering & Technolog
 
 {otp_code}
 
-This code is valid for 10 minutes.
+This code is valid for 5 minutes.
 For security, please never share this verification code with anyone.
 
 NK Orchid College of Engineering & Technology, Solapur
@@ -826,7 +1026,7 @@ AssociationHub & Campus Community Gateway
           {otp_code}
         </div>
         <div style="font-size: 11px; color: #19D68C; font-weight: 700; margin-top: 6px;">
-          ⏱️ Valid for 10 minutes only
+          ⏱️ Valid for 5 minutes only
         </div>
       </div>
 
@@ -866,22 +1066,26 @@ AssociationHub & Campus Community Gateway
         server.sendmail(smtp_user, [to_email], msg.as_string())
         server.quit()
         return {"sent": True, "configured": True}
-    except smtplib.SMTPAuthenticationError as e:
+    except smtplib.SMTPAuthenticationError:
         return {
             "sent": False,
             "configured": True,
-            "reason": f"Google SMTP Authentication Failed: Ensure you are using a 16-character Google App Password (not standard account password). Details: {str(e)}"
+            "reason": "SMTP authentication failed"
         }
-    except Exception as e:
+    except Exception:
         return {
             "sent": False,
             "configured": True,
-            "reason": f"SMTP Dispatch Error ({smtp_host}:{smtp_port}): {str(e)}"
+            "reason": "SMTP dispatch failed"
         }
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global ADMIN_SECRET_PIN, NKOCET_CRYPTO_SECRET
+    config = load_server_configuration()
+    ADMIN_SECRET_PIN = config["admin_pin"]
+    NKOCET_CRYPTO_SECRET = config["crypto_secret"]
     init_db()
     print("[SERVER] Database schemas verified & connection pool ready.")
     yield
@@ -899,19 +1103,23 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://affanchoudhari2006-lang.github.io"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Admin-Key",
+        "X-Admin-Pin",
+        "X-Admin-Token",
+        "X-Chat-Token",
+    ],
 )
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    """Enforces essential defense-in-depth security headers & universal CORS on all responses."""
-    if request.method == "OPTIONS":
-        response = JSONResponse(content={"status": "ok"})
-    else:
-        response = await call_next(request)
+    """Enforces essential defense-in-depth security headers."""
+    response = await call_next(request)
 
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
@@ -919,15 +1127,6 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     
-    # Universal CORS support for file:// (origin: 'null') and localhost dev servers
-    origin = request.headers.get("origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-    else:
-        response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Pin, X-Admin-PIN, X-Admin-Key, X-Admin-Token, X-Requested-With, Accept, Origin, *"
     return response
 
 
@@ -962,6 +1161,14 @@ class StudentSendOtpRequest(BaseModel):
     dept: str = Field(..., min_length=2, max_length=100)
     password: str = Field(..., min_length=6, max_length=100)
     confirm_password: str = Field(..., min_length=6, max_length=100)
+    session_id: str = Field(..., min_length=32, max_length=64)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
 
     @field_validator("email")
     @classmethod
@@ -980,6 +1187,7 @@ class StudentSendOtpRequest(BaseModel):
 class StudentVerifyOtpRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=120)
     otp: str = Field(..., min_length=6, max_length=6)
+    session_id: str = Field(..., min_length=32, max_length=64)
 
     @field_validator("email")
     @classmethod
@@ -991,6 +1199,13 @@ class StudentVerifyOtpRequest(BaseModel):
     def clean_otp(cls, v: str) -> str:
         return v.strip()
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
+
 
 class StudentCompleteRegistrationRequest(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
@@ -999,6 +1214,7 @@ class StudentCompleteRegistrationRequest(BaseModel):
     dept: str = Field(..., min_length=2, max_length=100)
     password: str = Field(..., min_length=6, max_length=100)
     verification_token: str = Field(..., min_length=10, max_length=120)
+    session_id: str = Field(..., min_length=32, max_length=64)
 
     @field_validator("email")
     @classmethod
@@ -1010,11 +1226,20 @@ class StudentCompleteRegistrationRequest(BaseModel):
     def sanitize(cls, v: str) -> str:
         return html.escape(re.sub(r'<[^>]*?>', '', v).strip())
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
+
 
 class SendOtpRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=120)
     name: Optional[str] = Field(None, max_length=100)
     roll_no: Optional[str] = Field(None, max_length=50)
+    association: Optional[str] = Field(None, max_length=20)
+    session_id: str = Field(..., min_length=32, max_length=64)
 
     @field_validator("email")
     @classmethod
@@ -1024,13 +1249,22 @@ class SendOtpRequest(BaseModel):
             raise ValueError("Invalid email format. Please provide a valid student Gmail address.")
         return v
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
 
-class SmtpConfigRequest(BaseModel):
-    user: str = Field(..., min_length=3, max_length=150)
-    password: str = Field(..., min_length=1, max_length=150)
-    host: str = Field(default="smtp.gmail.com", max_length=100)
-    port: int = Field(default=587)
-    from_name: str = Field(default="NKOCET Solapur Verification Gateway", max_length=100)
+    @field_validator("association")
+    @classmethod
+    def validate_association(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().upper()
+        if clean not in ALLOWED_ASSOCIATIONS:
+            raise ValueError("Invalid association")
+        return clean
 
 
 class SmtpTestRequest(BaseModel):
@@ -1040,6 +1274,9 @@ class SmtpTestRequest(BaseModel):
 class VerifyOtpRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=120)
     otp: str = Field(..., min_length=4, max_length=10)
+    session_id: str = Field(..., min_length=32, max_length=64)
+    roll_no: str = Field(..., min_length=1, max_length=50)
+    association: str = Field(..., min_length=2, max_length=20)
 
     @field_validator("email")
     @classmethod
@@ -1051,6 +1288,75 @@ class VerifyOtpRequest(BaseModel):
     def clean_otp(cls, v: str) -> str:
         return v.strip()
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
+
+    @field_validator("roll_no")
+    @classmethod
+    def clean_roll(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @field_validator("association")
+    @classmethod
+    def clean_association(cls, v: str) -> str:
+        clean = v.strip().upper()
+        if clean not in ALLOWED_ASSOCIATIONS:
+            raise ValueError("Invalid association")
+        return clean
+
+
+class MembershipLookupRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=120)
+    email: str = Field(..., min_length=5, max_length=120)
+    roll_no: str = Field(..., min_length=1, max_length=50)
+    association: str = Field(..., min_length=2, max_length=20)
+    otp_token: str = Field(..., min_length=10, max_length=100)
+    session_id: str = Field(..., min_length=32, max_length=64)
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower()
+
+    @field_validator("roll_no")
+    @classmethod
+    def clean_roll(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @field_validator("association")
+    @classmethod
+    def clean_association(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
+
+
+class MembershipLookupOtpRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=120)
+    email: str = Field(..., min_length=5, max_length=120)
+    session_id: str = Field(..., min_length=32, max_length=64)
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower()
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
+
 
 class ChatRegisterRequest(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
@@ -1058,6 +1364,7 @@ class ChatRegisterRequest(BaseModel):
     dept: str = Field(..., min_length=2, max_length=100)
     email: str = Field(..., min_length=5, max_length=120)
     otp: str = Field(..., min_length=4, max_length=10)
+    session_id: str = Field(..., min_length=32, max_length=64)
 
     @field_validator("email")
     @classmethod
@@ -1072,6 +1379,12 @@ class ChatRegisterRequest(BaseModel):
     def sanitize(cls, v: str) -> str:
         return html.escape(re.sub(r'<[^>]*?>', '', v).strip())
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
 
 class ChatUserStatusUpdate(BaseModel):
     status: str = Field(..., min_length=3, max_length=20)
@@ -1086,6 +1399,14 @@ class MembershipCreate(BaseModel):
     interest: Optional[str] = Field(None, max_length=250)
     email: Optional[str] = Field(None, max_length=120)
     otp_token: Optional[str] = Field(None, max_length=100)
+    session_id: str = Field(..., min_length=32, max_length=64)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
+            raise ValueError("Invalid verification session")
+        return v.lower()
 
     @field_validator("email")
     @classmethod
@@ -1379,18 +1700,21 @@ async def student_register_send_otp(data: StudentSendOtpRequest, request: Reques
 
         # 5. Persist hashed OTP, timestamps and reset attempts in email_otp_verifications
         cursor.execute("""
-        INSERT INTO email_otp_verifications (email, otp_hash, otp_code, roll_no, expires_at, last_sent_at, attempts, is_verified, created_at)
-        VALUES (?, ?, '', ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+        INSERT INTO email_otp_verifications
+            (email, otp_hash, otp_code, roll_no, association, session_id, expires_at, last_sent_at, attempts, is_verified, created_at)
+        VALUES (?, ?, '', ?, NULL, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
         ON CONFLICT(email) DO UPDATE SET
             otp_hash = excluded.otp_hash,
             otp_code = '',
             roll_no = excluded.roll_no,
+            association = NULL,
+            session_id = excluded.session_id,
             expires_at = excluded.expires_at,
             last_sent_at = excluded.last_sent_at,
             attempts = 0,
             is_verified = 0,
             verification_token = NULL;
-        """, (email, otp_hash, roll, expires_at, now))
+        """, (email, otp_hash, roll, data.session_id, expires_at, now))
         log_audit_event("STUDENT_OTP_REQUESTED", ip, f"Student registration OTP requested for {email} (Roll: {roll})", conn=conn)
 
     # 6. Dispatch real email to student's exact Gmail via SMTP
@@ -1399,7 +1723,7 @@ async def student_register_send_otp(data: StudentSendOtpRequest, request: Reques
         log_audit_event("EMAIL_DISPATCH_FAILED", ip, f"Real Gmail dispatch failed to {email}: {smtp_res.get('reason')}")
         raise HTTPException(
             status_code=503,
-            detail=f"Gmail Delivery Error: {smtp_res.get('reason')}. Please ensure SMTP_USER and SMTP_PASSWORD are configured in Admin Console."
+            detail="Verification email could not be sent. Please try again later."
         )
 
     log_audit_event("STUDENT_REAL_EMAIL_DISPATCHED", ip, f"Dispatched real OTP to student Gmail {email}")
@@ -1427,7 +1751,10 @@ async def student_register_verify_otp(data: StudentVerifyOtpRequest, request: Re
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT otp_hash, expires_at, attempts FROM email_otp_verifications WHERE email = ?;", (email,))
+        cursor.execute("""
+        SELECT otp_hash, expires_at, attempts FROM email_otp_verifications
+        WHERE email = ? AND session_id = ?;
+        """, (email, data.session_id))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(
@@ -1453,7 +1780,7 @@ async def student_register_verify_otp(data: StudentVerifyOtpRequest, request: Re
         candidate_hash = hash_otp(otp, email)
         if not row["otp_hash"] or not hmac.compare_digest(row["otp_hash"], candidate_hash):
             new_attempts = row["attempts"] + 1
-            cursor.execute("UPDATE email_otp_verifications SET attempts = ? WHERE email = ?;", (new_attempts, email))
+            cursor.execute("UPDATE email_otp_verifications SET attempts = ? WHERE email = ? AND session_id = ?;", (new_attempts, email, data.session_id))
             conn.commit()
             remaining = 5 - new_attempts
             if remaining <= 0:
@@ -1474,10 +1801,13 @@ async def student_register_verify_otp(data: StudentVerifyOtpRequest, request: Re
         SET is_verified = 1,
             verification_token = ?,
             verified_at = ?,
-            otp_hash = '',
+            otp_hash = NULL,
             attempts = 0
-        WHERE email = ?;
-        """, (token, now_str, email))
+        WHERE email = ? AND session_id = ? AND otp_hash = ?
+          AND is_verified = 0 AND expires_at > ?;
+        """, (token, now_str, email, data.session_id, row["otp_hash"], time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=400, detail="OTP verification session expired or was already used. Please request a new code.")
 
         log_audit_event("STUDENT_GMAIL_VERIFIED", ip, f"Verified student Gmail {email} successfully", conn=conn)
 
@@ -1513,10 +1843,12 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
         cursor = conn.cursor()
 
         # STRICT BACKEND ENFORCEMENT: Verify that Gmail was verified via OTP
+        now = time.time()
         cursor.execute("""
         SELECT is_verified, verified_at FROM email_otp_verifications
-        WHERE email = ? AND verification_token = ? AND is_verified = 1;
-        """, (email, token))
+        WHERE email = ? AND roll_no = ? AND session_id = ?
+          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
+        """, (email, roll, data.session_id, token, now))
         vrow = cursor.fetchone()
         if not vrow:
             log_audit_event("REGISTRATION_BLOCKED_UNVERIFIED", ip, f"Blocked unauthorized registration attempt for {email}: Missing/invalid OTP verification token", conn=conn)
@@ -1524,6 +1856,15 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
                 status_code=403,
                 detail="REGISTRATION BLOCKED: Gmail verification required. You cannot register an account without successfully verifying your Gmail with OTP. Direct API bypass rejected."
             )
+
+        cursor.execute("""
+        UPDATE email_otp_verifications
+        SET verification_token = NULL, is_verified = 0, verified_at = NULL, otp_hash = NULL
+        WHERE email = ? AND roll_no = ? AND session_id = ?
+          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
+        """, (email, roll, data.session_id, token, time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=403, detail="Registration verification expired or has already been used. Please verify again.")
 
         # Duplicate check: Email
         cursor.execute("SELECT student_id FROM registered_students WHERE email = ? LIMIT 1;", (email,))
@@ -1555,21 +1896,12 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?);
         """, (student_id, name, email, roll, dept, pwd_hash, salt, verified_at, created_at))
 
-        # Invalidate the one-time verification token so it can NEVER be reused
-        cursor.execute("""
-        UPDATE email_otp_verifications
-        SET verification_token = NULL,
-            is_verified = 0
-        WHERE email = ?;
-        """, (email,))
-
         # Synchronize into memberships table if not present so gate & verify know them
         cursor.execute("SELECT pass_id FROM memberships WHERE roll_no = ?;", (roll,))
         if not cursor.fetchone():
             pass_id = f"NKOCET-2026-CSESA-{secrets.token_hex(3).upper()}"
             sig = compute_hmac_signature(pass_id, roll, "CSESA")
-            base_url = str(request.base_url).rstrip("/")
-            verify_url = f"{base_url}/verify.html?pass_id={pass_id}&sig={sig}"
+            verify_url = build_verification_url(pass_id, sig)
             qr_b64 = make_qr_base64(verify_url)
             cursor.execute("""
             INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
@@ -1647,18 +1979,26 @@ async def send_email_otp(data: SendOtpRequest, request: Request):
         expires_at = now + 300  # Strictly 5 minutes validity
 
         # 4. Store hashed OTP, timestamps, and reset attempt counter in database
+        if request.url.path == "/api/auth/send-otp" and (not roll or not data.association):
+            raise HTTPException(status_code=400, detail="Roll number and association are required for membership verification.")
+
         cursor.execute("""
-        INSERT INTO email_otp_verifications (email, otp_hash, otp_code, roll_no, expires_at, last_sent_at, attempts, is_verified, created_at)
-        VALUES (?, ?, '', ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+        INSERT INTO email_otp_verifications
+            (email, otp_hash, otp_code, roll_no, association, session_id, expires_at, last_sent_at, attempts, is_verified, created_at)
+        VALUES (?, ?, '', ?, ?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
         ON CONFLICT(email) DO UPDATE SET
             otp_hash = excluded.otp_hash,
             otp_code = '',
             roll_no = excluded.roll_no,
+            association = excluded.association,
+            session_id = excluded.session_id,
             expires_at = excluded.expires_at,
             last_sent_at = excluded.last_sent_at,
             attempts = 0,
-            is_verified = 0;
-        """, (email, otp_hash, roll, expires_at, now))
+            is_verified = 0,
+            verification_token = NULL,
+            verified_at = NULL;
+        """, (email, otp_hash, roll, data.association, data.session_id, expires_at, now))
         log_audit_event("OTP_REQUESTED", ip, f"OTP requested for {email} (Roll: {roll})", conn=conn)
 
     # 5. Dispatch real email via Gmail SMTP
@@ -1669,7 +2009,7 @@ async def send_email_otp(data: SendOtpRequest, request: Request):
         log_audit_event("EMAIL_DISPATCH_FAILED", ip, f"Gmail SMTP delivery failed to {email}: {smtp_res.get('reason')}")
         raise HTTPException(
             status_code=503,
-            detail=f"Gmail Delivery Error: {smtp_res.get('reason')}. Please ensure SMTP_USER and SMTP_PASSWORD are configured in .env."
+            detail="Verification email could not be sent. Please try again later."
         )
 
     log_audit_event("REAL_EMAIL_DISPATCHED", ip, f"Dispatched real email with OTP to {email}")
@@ -1698,12 +2038,15 @@ async def verify_email_otp(data: VerifyOtpRequest, request: Request):
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT otp_hash, expires_at, attempts FROM email_otp_verifications WHERE email = ?;", (email,))
+        cursor.execute("""
+        SELECT otp_hash, expires_at, attempts FROM email_otp_verifications
+        WHERE email = ? AND session_id = ? AND roll_no IS ? AND association IS ?;
+        """, (email, data.session_id, data.roll_no, data.association))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=400, detail="No verification request found for this email. Please click 'Send OTP' first.")
 
-        if time.time() > row["expires_at"]:
+        if time.time() >= row["expires_at"]:
             raise HTTPException(status_code=400, detail="OTP verification code has expired (5-minute validity limit). Please request a new code.")
 
         if row["attempts"] >= 5:
@@ -1713,7 +2056,10 @@ async def verify_email_otp(data: VerifyOtpRequest, request: Request):
         candidate_hash = hash_otp(otp, email)
         if not hmac.compare_digest(row["otp_hash"] or "", candidate_hash):
             new_attempts = row["attempts"] + 1
-            cursor.execute("UPDATE email_otp_verifications SET attempts = ? WHERE email = ?;", (new_attempts, email))
+            cursor.execute("""
+            UPDATE email_otp_verifications SET attempts = ?
+            WHERE email = ? AND session_id = ? AND roll_no IS ? AND association IS ?;
+            """, (new_attempts, email, data.session_id, data.roll_no, data.association))
             conn.commit()
             remaining = 5 - new_attempts
             if remaining <= 0:
@@ -1727,9 +2073,13 @@ async def verify_email_otp(data: VerifyOtpRequest, request: Request):
         SET is_verified = 1,
             verification_token = ?,
             verified_at = ?,
-            attempts = 0
-        WHERE email = ?;
-        """, (token, now_str, email))
+            attempts = 0,
+            otp_hash = NULL
+        WHERE email = ? AND session_id = ? AND roll_no IS ? AND association IS ?
+          AND otp_hash = ? AND is_verified = 0 AND expires_at > ?;
+        """, (token, now_str, email, data.session_id, data.roll_no, data.association, row["otp_hash"], time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=400, detail="OTP verification session expired or was already used. Please request a new code.")
 
         log_audit_event("GMAIL_VERIFIED", ip, f"Verified email {email} successfully", conn=conn)
 
@@ -1768,7 +2118,10 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT otp_hash, expires_at, attempts FROM email_otp_verifications WHERE email = ?;", (email,))
+        cursor.execute("""
+        SELECT otp_hash, expires_at, attempts FROM email_otp_verifications
+        WHERE email = ? AND session_id = ? AND roll_no = ? AND association IS NULL;
+        """, (email, data.session_id, roll))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=400, detail="No verification request found for this email. Please click 'Send OTP' first.")
@@ -1782,7 +2135,10 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
         candidate_hash = hash_otp(otp, email)
         if not hmac.compare_digest(row["otp_hash"] or "", candidate_hash):
             new_attempts = row["attempts"] + 1
-            cursor.execute("UPDATE email_otp_verifications SET attempts = ? WHERE email = ?;", (new_attempts, email))
+            cursor.execute("""
+            UPDATE email_otp_verifications SET attempts = ?
+            WHERE email = ? AND session_id = ? AND roll_no = ? AND association IS NULL;
+            """, (new_attempts, email, data.session_id, roll))
             conn.commit()
             remaining = 5 - new_attempts
             if remaining <= 0:
@@ -1803,30 +2159,39 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
         SET is_verified = 1,
             verification_token = ?,
             verified_at = ?,
-            attempts = 0
-        WHERE email = ?;
-        """, (token, now_str, email))
+            attempts = 0,
+            otp_hash = NULL
+        WHERE email = ? AND session_id = ? AND roll_no = ?
+          AND association IS NULL AND otp_hash = ?
+          AND is_verified = 0 AND expires_at > ?;
+        """, (token, now_str, email, data.session_id, roll, row["otp_hash"], time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=400, detail="OTP verification session expired or was already used. Please request a new code.")
 
         user_id = existing_user["user_id"] if existing_user else f"CHAT-USER-{secrets.token_hex(4).upper()}"
         session_token = f"CHAT_SESSION.{secrets.token_hex(16)}"
+        session_expires_at = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
 
         cursor.execute("""
-        INSERT INTO community_users (user_id, name, roll_no, email, dept, status, session_token, created_at, last_active)
-        VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+        INSERT INTO community_users
+            (user_id, name, roll_no, email, dept, status, session_token, session_expires_at, session_revoked_at, created_at, last_active)
+        VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, NULL, ?, ?)
         ON CONFLICT(email) DO UPDATE SET
             name = excluded.name,
             roll_no = excluded.roll_no,
             dept = excluded.dept,
             session_token = excluded.session_token,
+            session_expires_at = excluded.session_expires_at,
+            session_revoked_at = NULL,
             last_active = excluded.last_active;
-        """, (user_id, name, roll, email, dept, session_token, now_str, now_str))
+        """, (user_id, name, roll, email, dept, session_token, session_expires_at, now_str, now_str))
 
         # Ensure student is recorded in memberships table so gate & verify know them
         cursor.execute("SELECT pass_id FROM memberships WHERE roll_no = ?;", (roll,))
         if not cursor.fetchone():
             pass_id = f"NKOCET-2026-CSESA-{secrets.token_hex(3).upper()}"
             sig = compute_hmac_signature(pass_id, roll, "CSESA")
-            qr_url = f"http://127.0.0.1:8080/verify.html?pass_id={pass_id}&sig={sig}"
+            qr_url = build_verification_url(pass_id, sig)
             qr_b64 = make_qr_base64(qr_url)
             cursor.execute("""
             INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
@@ -1852,7 +2217,7 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
         if not cursor.fetchone():
             pass_id = f"NKOCET-2026-CSESA-{secrets.token_hex(3).upper()}"
             sig = compute_hmac_signature(pass_id, roll, "CSESA")
-            qr_url = f"http://127.0.0.1:8080/verify.html?pass_id={pass_id}&sig={sig}"
+            qr_url = build_verification_url(pass_id, sig)
             qr_b64 = make_qr_base64(qr_url)
             cursor.execute("""
             INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
@@ -1879,13 +2244,20 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
 @app.get("/api/chat/auth/me")
 async def get_chat_current_user(request: Request):
     """Validates active chat token and returns user profile & status."""
-    token = request.headers.get("X-Chat-Token") or request.query_params.get("token")
+    token = request.headers.get("X-Chat-Token")
     if not token:
         raise HTTPException(status_code=401, detail="Unauthenticated: No active chat session token.")
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, roll_no, email, dept, status, created_at FROM community_users WHERE session_token = ?;", (token.strip(),))
+        cursor.execute("""
+        SELECT user_id, name, roll_no, email, dept, status, created_at
+        FROM community_users
+        WHERE session_token = ? AND session_revoked_at IS NULL
+          AND session_expires_at IS NOT NULL
+          AND julianday(session_expires_at) > julianday('now')
+          AND status IN ('ACTIVE', 'MUTED');
+        """, (token.strip(),))
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=401, detail="Session expired or invalid. Please verify with Gmail again.")
@@ -1915,10 +2287,8 @@ async def create_membership(data: MembershipCreate, request: Request):
     year = data.year.strip()
     assoc = data.association
     email = (data.email or "").strip().lower()
-    if not email:
-        clean_roll = re.sub(r'[^a-zA-Z0-9]', '', roll).lower() or "student"
-        email = f"{clean_roll}@orchidengg.ac.in"
     otp_token = data.otp_token
+    session_id = data.session_id
     interest = data.interest.strip() if data.interest else "General Technical Participation & Workshops"
 
     # Enforce Rejoin Approval Gate: Blocked or removed students require Admin approval to rejoin
@@ -1927,8 +2297,20 @@ async def create_membership(data: MembershipCreate, request: Request):
     with get_db() as conn:
         cursor = conn.cursor()
 
+        if not email or not otp_token:
+            raise HTTPException(status_code=403, detail="Verify your email with the current OTP before retrieving or creating a membership pass.")
+
+        cursor.execute("""
+        UPDATE email_otp_verifications
+        SET is_verified = 0, verification_token = NULL, verified_at = NULL, otp_hash = NULL
+        WHERE email = ? AND roll_no = ? AND association = ? AND session_id = ?
+          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
+        """, (email, roll, assoc, session_id, otp_token, time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=403, detail="Email verification is missing, expired, used, or does not match this student and association. Please verify again.")
+
         # 1. Existing Member Check: If student already registered for this club or has a pass,
-        # return their official Digital Pass immediately with their QR code and Verified Student ID!
+        # return their official Digital Pass only after consuming an OTP bound to this member.
         cursor.execute("""
         SELECT pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at
         FROM memberships
@@ -1940,12 +2322,8 @@ async def create_membership(data: MembershipCreate, request: Request):
         if existing:
             pass_id = existing["pass_id"]
             sig = existing["crypto_signature"] or compute_hmac_signature(pass_id, existing["roll_no"], existing["association"])
-            base_url = str(request.base_url).rstrip("/")
-            verify_url = f"{base_url}/verify.html?pass_id={pass_id}&sig={sig}"
-            qr_b64 = existing["qr_code_base64"]
-            if not qr_b64:
-                qr_b64 = make_qr_base64(verify_url)
-                cursor.execute("UPDATE memberships SET qr_code_base64 = ? WHERE pass_id = ?;", (qr_b64, pass_id))
+            verify_url = build_verification_url(pass_id, sig)
+            qr_b64 = make_qr_base64(verify_url)
 
             # Fetch or generate Verified Student ID
             cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR (roll_no != '' AND roll_no = ?) LIMIT 1;", 
@@ -1979,22 +2357,8 @@ async def create_membership(data: MembershipCreate, request: Request):
                 "message": f"Welcome back, {existing['name']}! Your official Digi-Pass was loaded from the database."
             }
 
-        # 2. Check if student verified Gmail via OTP
-        is_verified = 0
-        if otp_token:
-            cursor.execute("""
-            SELECT is_verified FROM email_otp_verifications
-            WHERE email = ? AND verification_token = ? AND is_verified = 1;
-            """, (email, otp_token))
-            if cursor.fetchone():
-                is_verified = 1
-        else:
-            cursor.execute("""
-            SELECT is_verified FROM email_otp_verifications
-            WHERE email = ? AND is_verified = 1;
-            """, (email,))
-            if cursor.fetchone():
-                is_verified = 1
+        # The verified token was consumed before the existing-member lookup above.
+        is_verified = 1
 
         # 3. Generate unique Pass ID
         unique_hex = secrets.token_hex(3).upper()
@@ -2004,8 +2368,7 @@ async def create_membership(data: MembershipCreate, request: Request):
         sig = compute_hmac_signature(pass_id, roll, assoc)
 
         # Generate verification QR Code with signature
-        base_url = str(request.base_url).rstrip("/")
-        verify_url = f"{base_url}/verify.html?pass_id={pass_id}&sig={sig}"
+        verify_url = build_verification_url(pass_id, sig)
         qr_b64 = make_qr_base64(verify_url)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2051,31 +2414,60 @@ async def create_membership(data: MembershipCreate, request: Request):
 
 
 @app.get("/api/memberships")
-async def list_memberships(association: Optional[str] = None):
+async def list_memberships(request: Request, association: Optional[str] = None):
     """Lists registered members (excluding large QR base64 strings for speed)."""
+    verify_admin_access(request)
     with get_db() as conn:
         cursor = conn.cursor()
         if association:
             cursor.execute("""
-            SELECT pass_id, name, roll_no, dept, year, association, interest, status, crypto_signature, created_at
+            SELECT pass_id, name, roll_no, dept, year, association, interest, status, created_at
             FROM memberships WHERE association = ? ORDER BY created_at DESC;
             """, (association.strip().upper(),))
         else:
             cursor.execute("""
-            SELECT pass_id, name, roll_no, dept, year, association, interest, status, crypto_signature, created_at
+            SELECT pass_id, name, roll_no, dept, year, association, interest, status, created_at
             FROM memberships ORDER BY created_at DESC;
             """)
         rows = cursor.fetchall()
         return {"count": len(rows), "members": [dict(r) for r in rows]}
 
 
-@app.get("/api/memberships/lookup")
-async def lookup_membership(query: str, request: Request):
+@app.post("/api/memberships/lookup/send-otp")
+async def send_membership_lookup_otp(data: MembershipLookupOtpRequest, request: Request):
+    clean_q = data.query.strip()
+    with get_db() as conn:
+        row = conn.execute("""
+        SELECT roll_no, association, email, name
+        FROM memberships
+        WHERE pass_id = ? OR roll_no = ? OR email = ?
+        ORDER BY rowid DESC LIMIT 1;
+        """, (clean_q, clean_q.upper(), clean_q.lower())).fetchone()
+    if not row or (row["email"] or "").strip().lower() != data.email:
+        raise HTTPException(status_code=404, detail="No membership matching those details was found.")
+
+    otp_request = SendOtpRequest(
+        email=data.email,
+        name=row["name"],
+        roll_no=row["roll_no"],
+        association=row["association"],
+        session_id=data.session_id,
+    )
+    result = await send_email_otp(otp_request, request)
+    return {
+        **result,
+        "roll_no": row["roll_no"],
+        "association": row["association"],
+    }
+
+
+@app.post("/api/memberships/lookup")
+async def lookup_membership(data: MembershipLookupRequest, request: Request):
     """
-    Public Digi-Pass Lookup:
-    Allows any student to quickly find and display their official Digital Pass using their Roll No, Email, or Pass ID.
+    Retrieves a digital pass only after consuming an OTP bound to its email,
+    roll number, association, and verification session.
     """
-    clean_q = (query or "").strip()
+    clean_q = data.query.strip()
     if not clean_q or len(clean_q) < 2:
         raise HTTPException(status_code=400, detail="Please enter a valid Roll No, PRN, Email, or Pass ID.")
 
@@ -2089,14 +2481,24 @@ async def lookup_membership(query: str, request: Request):
         """, (clean_q, clean_q.upper(), clean_q.lower()))
         m = cursor.fetchone()
 
-        if not m:
-            raise HTTPException(status_code=404, detail=f"No active membership pass found for '{clean_q}'. Please register to generate your pass.")
+        if (not m or (m["email"] or "").strip().lower() != data.email
+                or m["roll_no"].strip().upper() != data.roll_no
+                or m["association"].strip().upper() != data.association):
+            raise HTTPException(status_code=404, detail="No membership matching those details was found.")
+
+        cursor.execute("""
+        UPDATE email_otp_verifications
+        SET is_verified = 0, verification_token = NULL, verified_at = NULL, otp_hash = NULL
+        WHERE email = ? AND roll_no = ? AND association = ? AND session_id = ?
+          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
+        """, (data.email, data.roll_no, data.association, data.session_id, data.otp_token, time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=403, detail="Email verification is missing, expired, used, or does not match this pass. Please verify again.")
 
         pass_id = m["pass_id"]
         sig = m["crypto_signature"] or compute_hmac_signature(pass_id, m["roll_no"], m["association"])
-        base_url = str(request.base_url).rstrip("/")
-        verify_url = f"{base_url}/verify.html?pass_id={pass_id}&sig={sig}"
-        qr_b64 = m["qr_code_base64"] or make_qr_base64(verify_url)
+        verify_url = build_verification_url(pass_id, sig)
+        qr_b64 = make_qr_base64(verify_url)
 
         cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR (roll_no != '' AND roll_no = ?) LIMIT 1;", (m["email"], m["roll_no"]))
         s_row = cursor.fetchone()
@@ -2145,7 +2547,22 @@ async def verify_membership(pass_id: str, request: Request, sig: Optional[str] =
 
         status = row["status"] if "status" in row.keys() and row["status"] else "ACTIVE"
         expected_sig = compute_hmac_signature(row["pass_id"], row["roll_no"], row["association"])
-        sig_valid = hmac.compare_digest(expected_sig, sig) if sig else True
+        sig_valid = bool(sig) and hmac.compare_digest(expected_sig, sig)
+        if not sig_valid:
+            log_audit_event(
+                "GATE_VERIFY_INVALID_SIGNATURE",
+                ip,
+                f"Invalid or missing signature for pass {clean_id}",
+                conn=conn,
+            )
+            return {
+                "valid": False,
+                "status": "INVALID_SIGNATURE",
+                "signature_verified": False,
+                "message": "The pass signature is missing or invalid. Scan the original signed QR code.",
+            }
+        verify_url = build_verification_url(row["pass_id"], expected_sig)
+        qr_b64 = make_qr_base64(verify_url)
 
         if status == "SUSPENDED":
             log_audit_event("GATE_VERIFY_SUSPENDED", ip, f"Suspended pass inspected: {clean_id}")
@@ -2164,6 +2581,8 @@ async def verify_membership(pass_id: str, request: Request, sig: Optional[str] =
                     "association": row["association"],
                     "interest": row["interest"],
                     "status": "SUSPENDED",
+                    "qr_code_base64": qr_b64,
+                    "verify_url": verify_url,
                     "crypto_signature": expected_sig,
                     "created_at": row["created_at"]
                 }
@@ -2184,7 +2603,8 @@ async def verify_membership(pass_id: str, request: Request, sig: Optional[str] =
                 "association": row["association"],
                 "interest": row["interest"],
                 "status": status,
-                "qr_code_base64": row["qr_code_base64"],
+                "qr_code_base64": qr_b64,
+                "verify_url": verify_url,
                 "crypto_signature": expected_sig,
                 "created_at": row["created_at"]
             }
@@ -2569,8 +2989,11 @@ async def verify_admin_pin(data: AdminPinVerify, request: Request):
     ip = get_client_ip(request)
     check_admin_brute_force(ip)
 
-    if data.pin.strip() == ADMIN_SECRET_PIN:
+    submitted_pin = data.pin.strip()
+    if hmac.compare_digest(submitted_pin.encode("utf-8"), ADMIN_SECRET_PIN.encode("utf-8")):
         _admin_failed_attempts.pop(ip, None)
+        with get_db() as conn:
+            conn.execute("DELETE FROM admin_failed_attempts WHERE ip_address = ?;", (ip,))
         token = create_admin_session_token()
         log_audit_event("ADMIN_LOGIN_SUCCESS", ip, "Coordinator Console clearance unlocked.")
         return {
@@ -2581,8 +3004,28 @@ async def verify_admin_pin(data: AdminPinVerify, request: Request):
         }
     
     record_admin_failed_attempt(ip)
-    log_audit_event("ADMIN_LOGIN_FAILED", ip, f"Invalid PIN entered: {data.pin[:2]}***")
+    log_audit_event("ADMIN_LOGIN_FAILED", ip, "Invalid PIN entered.")
     raise HTTPException(status_code=403, detail="Invalid Administrator Security PIN.")
+
+
+@app.post("/api/admin/logout")
+async def logout_admin(request: Request):
+    """Revokes the current administrator session token."""
+    verify_admin_access(request)
+    key = (
+        request.headers.get("X-Admin-Token")
+        or request.headers.get("X-Admin-Key")
+        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    )
+    if key.startswith("SESSION."):
+        parts = key.split(".")
+        if len(parts) >= 3:
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE admin_sessions SET revoked_at = ? WHERE session_id = ?;",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), parts[2]),
+                )
+    return {"success": True, "message": "Administrator session revoked."}
 
 
 @app.patch("/api/admin/members/{pass_id}/status")
@@ -2658,8 +3101,18 @@ async def update_student_account_status(student_id: str, data: StatusUpdate, req
         cursor.execute("UPDATE registered_students SET status = ? WHERE student_id = ?;", (new_status, clean_id))
         
         # Also sync to community_users and memberships
-        cursor.execute("UPDATE community_users SET status = ? WHERE email = ? OR roll_no = ?;", 
-                       ("BANNED" if new_status == "BLOCKED" else new_status, row["email"], row["roll_no"]))
+        community_status = "BANNED" if new_status == "BLOCKED" else new_status
+        if community_status == "ACTIVE":
+            cursor.execute(
+                "UPDATE community_users SET status = ? WHERE email = ? OR roll_no = ?;",
+                (community_status, row["email"], row["roll_no"]),
+            )
+        else:
+            cursor.execute("""
+            UPDATE community_users
+            SET status = ?, session_token = NULL, session_revoked_at = CURRENT_TIMESTAMP
+            WHERE email = ? OR roll_no = ?;
+            """, (community_status, row["email"], row["roll_no"]))
         cursor.execute("UPDATE memberships SET status = ? WHERE roll_no = ?;", (new_status, row["roll_no"]))
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3055,7 +3508,14 @@ async def update_chat_user_status(user_id: str, data: ChatUserStatusUpdate, requ
         if not row:
             raise HTTPException(status_code=404, detail="Chat user not found.")
 
-        cursor.execute("UPDATE community_users SET status = ? WHERE user_id = ?;", (status, clean_id))
+        if status == "BANNED":
+            cursor.execute("""
+            UPDATE community_users
+            SET status = ?, session_token = NULL, session_revoked_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?;
+            """, (status, clean_id))
+        else:
+            cursor.execute("UPDATE community_users SET status = ? WHERE user_id = ?;", (status, clean_id))
         log_audit_event("CHAT_USER_STATUS_CHANGE", ip, f"Admin updated chat user {clean_id} ({row['name']}) status to {status}", conn=conn)
 
         return {
@@ -3111,60 +3571,26 @@ async def list_security_audit_logs(request: Request, limit: int = 50):
 
 @app.get("/api/admin/smtp-config")
 async def get_admin_smtp_config(request: Request):
-    """Admin endpoint: Returns current SMTP configuration status with masked password."""
+    """Admin endpoint: Returns SMTP status only; credential values are never exposed."""
     verify_admin_access(request)
     cfg = get_smtp_config()
-    masked_pw = ""
-    if cfg["password"]:
-        if len(cfg["password"]) > 6:
-            masked_pw = cfg["password"][:3] + "•" * (len(cfg["password"]) - 6) + cfg["password"][-3:]
-        else:
-            masked_pw = "••••••••"
-
     return {
         "configured": bool(cfg["user"] and cfg["password"]),
         "user": cfg["user"],
         "host": cfg["host"],
         "port": cfg["port"],
-        "from_name": cfg["from_name"],
-        "masked_password": masked_pw
+        "from_name": cfg["from_name"]
     }
 
 
 @app.post("/api/admin/smtp-config")
-async def save_admin_smtp_config(data: SmtpConfigRequest, request: Request):
-    """Admin endpoint: Saves SMTP credentials to SQLite system_settings table."""
+async def save_admin_smtp_config(request: Request):
+    """Reject legacy SMTP credential writes; configure SMTP in the server environment."""
     verify_admin_access(request)
-    ip = get_client_ip(request)
-
-    user = data.user.strip()
-    password = data.password.strip().replace(" ", "")  # Google app passwords often have spaces like 'abcd efgh ijkl mnop'
-    host = data.host.strip()
-    port = str(data.port)
-    from_name = data.from_name.strip()
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        settings = [
-            ("smtp_user", user),
-            ("smtp_password", password),
-            ("smtp_host", host),
-            ("smtp_port", port),
-            ("smtp_from_name", from_name)
-        ]
-        for k, v in settings:
-            cursor.execute("""
-            INSERT INTO system_settings (key, value, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP;
-            """, (k, v))
-
-        log_audit_event("SMTP_CONFIG_UPDATED", ip, f"Admin updated SMTP mailer settings for {user}", conn=conn)
-
-    return {
-        "success": True,
-        "message": f"SMTP mailer configured successfully with sender: {user} ({host}:{port})"
-    }
+    raise HTTPException(
+        status_code=410,
+        detail="SMTP credentials can no longer be saved through the admin console. Configure them in the server environment and restart the service.",
+    )
 
 
 @app.post("/api/admin/smtp-test")
@@ -3214,13 +3640,13 @@ app.mount("/", StaticFiles(directory=DIRECTORY, html=True), name="static")
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    port = int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8080))
     print("============================================================")
     print("   ASSOCIATIONHUB FULL-STACK SERVER (NKOCET 2026)")
     print("============================================================")
     print(f">> Server running at: http://127.0.0.1:{port}")
     print(f">> API Docs: http://127.0.0.1:{port}/docs")
     print(f">> Community Pulse: http://127.0.0.1:{port}/#community")
-    print(f">> Admin Master Key: {ADMIN_SECRET_PIN}")
+    print(">> Admin PIN and cryptographic secret loaded from environment.")
     print("============================================================")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

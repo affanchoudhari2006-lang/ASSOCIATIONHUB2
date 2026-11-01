@@ -215,28 +215,11 @@
     </div>
   </footer>
 
+  <script src="api-config.js"></script>
   <script>
     const outputContainer = document.getElementById('verify-output');
     const inputField = document.getElementById('manual-pass-input');
     const verifyBtn = document.getElementById('manual-verify-btn');
-
-    // Universal API Router (Supports file:/// and localhost non-8080 dev servers)
-    const API_BASE = (function() {
-      if (typeof window === 'undefined') return '';
-      if (window.location.protocol === 'file:' || 
-          ((window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') && window.location.port !== '8080')) {
-        return 'http://127.0.0.1:8080';
-      }
-      return '';
-    })();
-
-    function apiFetch(path, options = {}) {
-      let url = path;
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        url = (API_BASE || '') + (url.startsWith('/') ? url : '/' + url);
-      }
-      return fetch(url, options);
-    }
 
     // High-Tech Web Audio Synthetic Cues (Zero External Asset Dependencies)
     let audioMuted = false;
@@ -715,7 +698,7 @@
       if (!pin) {
         if (errEl) {
           errEl.style.display = 'block';
-          errEl.textContent = 'Please enter the Master Administrator PIN (e.g. admin2026).';
+          errEl.textContent = 'Please enter the administrator PIN configured on the backend.';
         }
         if (pinInput) pinInput.focus();
         return;
@@ -727,7 +710,7 @@
       }
 
       try {
-        const resp = await apiFetch(`/api/memberships/${encodeURIComponent(passId)}?pin=${encodeURIComponent(pin)}`, {
+        const resp = await apiFetch(`/api/memberships/${encodeURIComponent(passId)}`, {
           method: 'DELETE',
           headers: {
             'X-Admin-Key': pin,
@@ -805,7 +788,7 @@
       
       <div style="margin-bottom: 1.25rem;">
         <label for="revoke-admin-pin" style="display: block; font-size: 0.76rem; color: var(--brand-gold); margin-bottom: 0.4rem; font-weight: 700; letter-spacing: 0.05em;">MASTER ADMINISTRATOR PIN *</label>
-        <input type="password" id="revoke-admin-pin" placeholder="Enter PIN (e.g. admin2026)" style="width: 100%; padding: 0.7rem 0.9rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.25); background: rgba(0,0,0,0.6); color: #FFFFFF; font-family: monospace; font-size: 1.05rem; letter-spacing: 0.1em;" autocomplete="current-password">
+        <input type="password" id="revoke-admin-pin" placeholder="Enter the configured administrator PIN" style="width: 100%; padding: 0.7rem 0.9rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.25); background: rgba(0,0,0,0.6); color: #FFFFFF; font-family: monospace; font-size: 1.05rem; letter-spacing: 0.1em;" autocomplete="current-password">
         <div id="revoke-error-msg" style="display: none; color: #ff5252; font-size: 0.8rem; margin-top: 0.45rem; font-weight: 600;"></div>
       </div>
       

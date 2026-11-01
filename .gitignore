@@ -10,15 +10,32 @@ __pycache__/
 
 # Local Environment & Secrets (NEVER COMMIT SENSITIVE PASSWORDS)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+.secrets
+.secrets.*
+*.secret
+secrets.json
+credentials.json
+credentials.*
 *.pem
 *.key
+*.p12
+*.pfx
 
 # SQLite Database (server.py automatically creates & seeds schemas on first launch)
 *.db
+*.sqlite
 *.sqlite3
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Distribution zip packages
 AssociationHub-FullStack-*.zip

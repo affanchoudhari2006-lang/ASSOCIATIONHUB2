@@ -554,12 +554,12 @@
                 <span style="font-size: 0.72rem; color: var(--brand-gold); margin-left: 0.35rem;">(Admin-Confidential)</span>
               </label>
               <span id="email-verify-status" style="font-size: 0.76rem; color: #19D68C; font-weight: 600;">
-                ⚡ Instant Pass + Gmail OTP
+                🔐 Gmail OTP required for new passes
               </span>
             </div>
             
             <div style="display: flex; gap: 0.5rem; align-items: center;">
-              <input type="email" id="member-email" class="form-input" placeholder="e.g. yourname@gmail.com (Optional)" style="flex: 1;">
+              <input type="email" id="member-email" class="form-input" placeholder="e.g. yourname@gmail.com (required for new passes)" style="flex: 1;">
               <button type="button" id="btn-send-otp" class="btn-secondary" onclick="sendGmailOtp()" style="padding: 0.5rem 0.95rem; font-size: 0.8rem; white-space: nowrap;">
                 <span>Send OTP ✉️</span>
               </button>
@@ -636,6 +636,7 @@
   </div>
 
   <!-- Core JavaScript -->
+  <script src="api-config.js"></script>
   <script src="main.js?v=20261101_v5"></script>
   <!-- Spotlight Quick Command Search Overlay (Ctrl + K) -->
   <div id="spotlight-overlay" class="spotlight-overlay" role="dialog" aria-modal="true" aria-label="Spotlight Search">
