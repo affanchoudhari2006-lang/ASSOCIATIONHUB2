@@ -1,0 +1,39 @@
+# ==============================================================================
+# NKOCET AssociationHub - .gitignore
+# ==============================================================================
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Local Environment & Secrets (NEVER COMMIT SENSITIVE PASSWORDS)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# SQLite Database (server.py automatically creates & seeds schemas on first launch)
+*.db
+*.sqlite3
+*.db-journal
+
+# Distribution zip packages
+AssociationHub-FullStack-*.zip
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary test and audit scratch files
+scratch/
+.system_generated/
