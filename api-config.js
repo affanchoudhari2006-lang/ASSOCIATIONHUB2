@@ -1,6 +1,6 @@
 (function (window) {
   // Set this to the deployed Render service URL before publishing GitHub Pages.
-  window.ASSOCIATIONHUB_API_BASE_URL = window.ASSOCIATIONHUB_API_BASE_URL || '';
+  window.ASSOCIATIONHUB_API_BASE_URL = 'https://associationhub2.onrender.com';
   const configuredBase = (window.ASSOCIATIONHUB_API_BASE_URL || '').trim();
   let apiBase = configuredBase.replace(/\/+$/, '');
 
