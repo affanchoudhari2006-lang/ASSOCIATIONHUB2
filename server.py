@@ -30,6 +30,7 @@ import re
 import csv
 import time
 import smtplib
+import logging
 from urllib.parse import urlsplit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -46,6 +47,8 @@ from pydantic import BaseModel, Field, field_validator
 # QR Code & Image generation
 import qrcode
 from PIL import Image
+
+logger = logging.getLogger("associationhub.smtp")
 
 # Reconfigure stdout/stderr for CP1252 Windows encoding
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -946,6 +949,27 @@ def get_smtp_config() -> Dict[str, Any]:
     }
 
 
+def sanitize_smtp_error(error: Exception, smtp_user: str = "", smtp_password: str = "", otp_code: str = "") -> str:
+    message = str(error)
+    if isinstance(getattr(error, "args", None), tuple):
+        smtp_args = getattr(error, "args", ())
+        if smtp_args:
+            message = " ".join(
+                arg.decode("utf-8", errors="replace") if isinstance(arg, bytes) else str(arg)
+                for arg in smtp_args
+            )
+
+    for sensitive_value in (smtp_password, smtp_user, otp_code):
+        if sensitive_value:
+            message = message.replace(sensitive_value, "<redacted>")
+
+    message = re.sub(r"(?i)\b(?:password|app\s*password|passwd|smtp_pass|credential|token)\b\s*[:=]\s*\S+", "<redacted>", message)
+    message = re.sub(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", "<redacted-email>", message, flags=re.IGNORECASE)
+    message = re.sub(r"\b\d{6}\b", "<redacted-code>", message)
+    message = re.sub(r"\s+", " ", message).strip()
+    return (message or "SMTP operation failed")[:300]
+
+
 def send_real_smtp_email(to_email: str, recipient_name: str, otp_code: str) -> Dict[str, Any]:
     """
     Connects to SMTP host (default smtp.gmail.com:587) via TLS, authenticates,
@@ -1066,13 +1090,29 @@ AssociationHub & Campus Community Gateway
         server.sendmail(smtp_user, [to_email], msg.as_string())
         server.quit()
         return {"sent": True, "configured": True}
-    except smtplib.SMTPAuthenticationError:
+    except smtplib.SMTPAuthenticationError as error:
+        sanitized_error = sanitize_smtp_error(error, smtp_user, smtp_pass, otp_code)
+        logger.error(
+            "SMTP authentication failed: exception=%s smtp_host=%s smtp_port=%s message=%s",
+            type(error).__name__,
+            smtp_host,
+            smtp_port,
+            sanitized_error,
+        )
         return {
             "sent": False,
             "configured": True,
             "reason": "SMTP authentication failed"
         }
-    except Exception:
+    except Exception as error:
+        sanitized_error = sanitize_smtp_error(error, smtp_user, smtp_pass, otp_code)
+        logger.error(
+            "SMTP dispatch failed: exception=%s smtp_host=%s smtp_port=%s message=%s",
+            type(error).__name__,
+            smtp_host,
+            smtp_port,
+            sanitized_error,
+        )
         return {
             "sent": False,
             "configured": True,
