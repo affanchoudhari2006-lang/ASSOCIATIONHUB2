@@ -8,23 +8,13 @@
 /* --------------------------------------------------------------------------
    GLOBAL UNIVERSAL API CLIENT & PROTOCOL ROUTER (NKOCET 2026)
    -------------------------------------------------------------------------- */
-window.API_BASE = (function() {
-  if (typeof window === 'undefined') return '';
-  // Support file:/// protocol or any non-8080 local dev servers (Live Server 5500, etc.)
-  if (window.location.protocol === 'file:' || 
-      ((window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') && window.location.port !== '8080')) {
-    return 'http://127.0.0.1:8080';
+window.createVerificationSessionId = function() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
   }
-  return '';
-})();
-
-window.apiFetch = function(path, options = {}) {
-  let url = path;
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    const base = window.API_BASE || '';
-    url = base + (url.startsWith('/') ? url : '/' + url);
-  }
-  return fetch(url, options);
+  const bytes = new Uint8Array(24);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 };
 
 // Background Offline Sync Engine for Passes Created Offline
@@ -880,12 +870,18 @@ function initMembershipModal() {
 
   let verifiedEmailToken = null;
   let isEmailVerified = false;
+  let verifiedEmail = null;
+  let verifiedRoll = null;
+  let verifiedAssociation = null;
+  let otpSessionId = null;
+  let otpRoll = null;
   let otpTimerInterval = null;
 
   // Gmail OTP Send Handler
   window.sendGmailOtp = async function() {
     const emailInput = document.getElementById('member-email');
     const rollInput = document.getElementById('member-roll');
+    const associationInput = document.getElementById('member-association');
     const emailStatus = document.getElementById('email-verify-status');
     const otpWrap = document.getElementById('otp-entry-wrap');
     const timerEl = document.getElementById('otp-timer');
@@ -894,12 +890,21 @@ function initMembershipModal() {
 
     const email = (emailInput ? emailInput.value : '').trim().toLowerCase();
     const roll = (rollInput ? rollInput.value : '').trim();
+    const association = (associationInput ? associationInput.value : '').trim().toUpperCase();
 
     if (!email || !email.includes('@')) {
       alert('Please enter a valid student Gmail address first (e.g. yourname@gmail.com).');
       if (emailInput) emailInput.focus();
       return;
     }
+
+    isEmailVerified = false;
+    verifiedEmailToken = null;
+    verifiedEmail = null;
+    verifiedRoll = null;
+    verifiedAssociation = null;
+    otpRoll = roll.toUpperCase();
+    otpSessionId = window.createVerificationSessionId();
 
     if (sendBtn) {
       sendBtn.disabled = true;
@@ -910,7 +915,12 @@ function initMembershipModal() {
       const res = await apiFetch('/api/auth/send-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email, roll_no: roll })
+        body: JSON.stringify({
+          email: email,
+          roll_no: roll,
+          association: association,
+          session_id: otpSessionId
+        })
       });
       const data = await res.json();
 
@@ -985,6 +995,7 @@ function initMembershipModal() {
   // Gmail OTP Verify Handler
   window.verifyGmailOtp = async function() {
     const emailInput = document.getElementById('member-email');
+    const associationInput = document.getElementById('member-association');
     const otpInput = document.getElementById('member-otp');
     const emailStatus = document.getElementById('email-verify-status');
     const otpWrap = document.getElementById('otp-entry-wrap');
@@ -992,6 +1003,7 @@ function initMembershipModal() {
     const sendBtn = document.getElementById('btn-send-otp');
 
     const email = (emailInput ? emailInput.value : '').trim().toLowerCase();
+    const association = (associationInput ? associationInput.value : '').trim().toUpperCase();
     const otp = (otpInput ? otpInput.value : '').trim();
 
     if (!otp || otp.length < 4) {
@@ -1009,13 +1021,22 @@ function initMembershipModal() {
       const res = await apiFetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email, otp: otp })
+        body: JSON.stringify({
+          email: email,
+          otp: otp,
+          roll_no: otpRoll,
+          association: association,
+          session_id: otpSessionId
+        })
       });
       const data = await res.json();
 
       if (res.ok && data.verified) {
         isEmailVerified = true;
         verifiedEmailToken = data.verification_token;
+        verifiedEmail = email;
+        verifiedRoll = otpRoll;
+        verifiedAssociation = association;
         if (otpTimerInterval) clearInterval(otpTimerInterval);
 
         if (emailStatus) {
@@ -1111,7 +1132,7 @@ function initMembershipModal() {
 
       const name = (nameInput?.value || '').trim();
       const roll = (rollInput?.value || '').trim().toUpperCase();
-      let email = (emailInput?.value || '').trim().toLowerCase();
+      const email = (emailInput?.value || '').trim().toLowerCase();
       const dept = (deptInput?.value || 'Computer Science & Engineering').trim();
       const year = (yearInput?.value || 'Second Year (SY)').trim();
       const association = (assocInput?.value || 'CSESA').trim();
@@ -1137,11 +1158,8 @@ function initMembershipModal() {
       if (nameInput) nameInput.style.borderColor = '';
       if (rollInput) rollInput.style.borderColor = '';
 
-      // Safe intelligent fallback for email if field is left blank
-      if (!email || !email.includes('@')) {
-        const cleanRoll = roll.toLowerCase().replace(/[^a-z0-9]/g, '') || 'member';
-        email = `${cleanRoll}@orchidengg.ac.in`;
-      }
+      const hasCurrentVerification = isEmailVerified && verifiedEmailToken &&
+        verifiedEmail === email && verifiedRoll === roll && verifiedAssociation === association;
 
       // Submit Button Loading State
       const submitBtn = form.querySelector('button[type="submit"]');
@@ -1155,7 +1173,8 @@ function initMembershipModal() {
         name: name,
         roll: roll,
         email: email,
-        otp_token: verifiedEmailToken,
+        otp_token: hasCurrentVerification ? verifiedEmailToken : null,
+        session_id: hasCurrentVerification ? otpSessionId : null,
         dept: dept,
         year: year,
         association: association,
@@ -1231,53 +1250,12 @@ function initMembershipModal() {
         renderDigitalPass(data);
 
       } catch (networkErr) {
-        console.warn('Backend API connection failed, activating instant client pass engine:', networkErr);
-
-        // INSTANT RESILIENT FALLBACK: Generate valid pass client-side
-        const randomHex = Math.random().toString(16).substring(2, 8).toUpperCase();
-        const fallbackPassId = `NKOCET-2026-${association}-${randomHex}`;
-        const fallbackStudentId = `NKOCET-STU-2026-${randomHex}`;
-        const nowStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
-        const baseUrl = window.API_BASE || 'http://127.0.0.1:8080';
-        const verifyUrl = `${baseUrl}/verify.html?pass_id=${fallbackPassId}`;
-        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(verifyUrl)}`;
-
-        const clientData = {
-          pass_id: fallbackPassId,
-          student_id: fallbackStudentId,
-          name: name,
-          roll_no: roll,
-          email: email,
-          dept: dept,
-          year: year,
-          association: association,
-          interest: interest || 'General Technical Participation & Workshops',
-          qr_code_base64: qrUrl,
-          verify_url: verifyUrl,
-          status: 'ACTIVE',
-          created_at: nowStr,
-          is_offline_cached: true,
-          message: `Official ${association} Digi-Pass generated and saved to your device!`
-        };
-
-        // Cache in localStorage and queue for background DB sync
-        try {
-          localStorage.setItem('orchid_student_roll', roll);
-          localStorage.setItem('orchid_student_name', name);
-          localStorage.setItem('orchid_student_email', email);
-          localStorage.setItem('orchid_student_pass', fallbackPassId);
-          localStorage.setItem('orchid_student_id', fallbackStudentId);
-
-          let passList = JSON.parse(localStorage.getItem('orchid_saved_passes') || '[]');
-          passList.unshift(clientData);
-          localStorage.setItem('orchid_saved_passes', JSON.stringify(passList.slice(0, 20)));
-
-          let queue = JSON.parse(localStorage.getItem('orchid_offline_pass_queue') || '[]');
-          queue.push(payload);
-          localStorage.setItem('orchid_offline_pass_queue', JSON.stringify(queue));
-        } catch(e) {}
-
-        renderDigitalPass(clientData);
+        console.warn('Backend API connection failed; membership outcome could not be confirmed:', networkErr);
+        const alertDiv = document.createElement('div');
+        alertDiv.id = 'membership-alert';
+        alertDiv.className = 'alert-banner alert-warning';
+        alertDiv.innerHTML = `<span>⚠️</span> <div>The membership service could not be reached. Check for an existing pass or try again when the service is online.</div>`;
+        formWrap.insertBefore(alertDiv, form);
 
         if (submitBtn) {
           submitBtn.disabled = false;
@@ -1508,34 +1486,61 @@ function initMembershipModal() {
       return;
     }
 
+    const email = (window.prompt('Enter the Gmail address registered to this pass:') || '').trim().toLowerCase();
+    if (!email) return;
+    const sessionId = window.createVerificationSessionId();
     try {
-      const res = await apiFetch(`/api/memberships/lookup?query=${encodeURIComponent(query)}`);
+      const sendRes = await apiFetch('/api/memberships/lookup/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, email, session_id: sessionId })
+      });
+      const sendData = await sendRes.json();
+      if (!sendRes.ok) {
+        alert(sendData.detail || 'Unable to send a verification code for that membership.');
+        return;
+      }
+
+      const otp = (window.prompt(`Enter the OTP sent to ${sendData.masked_email || email}:`) || '').trim();
+      if (!otp) return;
+      const verifyRes = await apiFetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          otp,
+          roll_no: sendData.roll_no,
+          association: sendData.association,
+          session_id: sessionId
+        })
+      });
+      const verifyData = await verifyRes.json();
+      if (!verifyRes.ok || !verifyData.verified) {
+        alert(verifyData.detail || 'Email verification failed.');
+        return;
+      }
+
+      const res = await apiFetch('/api/memberships/lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query,
+          email,
+          roll_no: sendData.roll_no,
+          association: sendData.association,
+          otp_token: verifyData.verification_token,
+          session_id: sessionId
+        })
+      });
       const data = await res.json();
       if (res.ok) {
         renderDigitalPass(data);
         return;
       }
+      alert(data.detail || 'Unable to retrieve that membership pass.');
     } catch (err) {
-      console.warn('API lookup failed, checking offline cache:', err);
+      alert('Unable to verify or retrieve the pass because the server could not be reached: ' + err.message);
     }
-
-    // Offline / LocalStorage Cache Fallback for Pass Lookup
-    try {
-      const passList = JSON.parse(localStorage.getItem('orchid_saved_passes') || '[]');
-      const qLower = query.toLowerCase();
-      const match = passList.find(p => 
-        (p.roll_no && p.roll_no.toLowerCase() === qLower) || 
-        (p.email && p.email.toLowerCase() === qLower) || 
-        (p.pass_id && p.pass_id.toLowerCase() === qLower) ||
-        (p.student_id && p.student_id.toLowerCase() === qLower)
-      );
-      if (match) {
-        renderDigitalPass(match);
-        return;
-      }
-    } catch (e) {}
-
-    alert(`No existing membership pass found for "${query}". Please fill out the form below to generate your official pass instantly.`);
   };
 
   const quickInput = document.getElementById('quick-pass-lookup');
@@ -1726,6 +1731,7 @@ function initCampusPulse() {
   let _pulseRealtimeTimer = null;
   let _isSyncingPosts = false;
   let _currentChatUser = null;
+  let chatOtpSessionId = null;
   let _gateOtpTimer = null;
   let _gateOtpSeconds = 600;
 
@@ -1860,11 +1866,17 @@ function initCampusPulse() {
       sendBtn.innerHTML = '<span>Sending... ⏳</span>';
     }
 
+    chatOtpSessionId = window.createVerificationSessionId();
     try {
       const res = await apiFetch('/api/chat/auth/send-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email, name: name })
+        body: JSON.stringify({
+          email: email,
+          name: name,
+          roll_no: roll,
+          session_id: chatOtpSessionId
+        })
       });
 
       const data = await res.json();
@@ -1968,7 +1980,8 @@ function initCampusPulse() {
           roll_no: roll,
           dept: dept,
           email: email,
-          otp: otp
+          otp: otp,
+          session_id: chatOtpSessionId
         })
       });
 
@@ -2634,7 +2647,18 @@ function initAdminConsole() {
     });
   }
 
-  window.lockAdminSuite = function() {
+  window.lockAdminSuite = async function() {
+    const token = sessionAdminToken || sessionStorage.getItem('orchid_admin_token') || '';
+    if (token) {
+      try {
+        await apiFetch('/api/admin/logout', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'X-Admin-Token': token }
+        });
+      } catch (err) {
+        // Local lockout still proceeds if the server is temporarily unavailable.
+      }
+    }
     sessionAdminPin = '';
     sessionAdminToken = '';
     sessionStorage.removeItem('orchid_admin_pin');
@@ -2668,10 +2692,22 @@ function initAdminConsole() {
   };
 
   // 1-Click Excel / CSV Export
-  window.exportMembersCsv = function() {
+  window.exportMembersCsv = async function() {
     if (!sessionAdminPin) return;
-    const url = `/api/admin/export/members.csv?admin_key=${encodeURIComponent(sessionAdminPin)}`;
-    window.open(url, '_blank');
+    try {
+      const response = await apiFetch('/api/admin/export/members.csv', {
+        headers: { 'X-Admin-Key': sessionAdminPin }
+      });
+      if (!response.ok) throw new Error('CSV export was rejected. Please verify your admin session.');
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = 'associationhub-members.csv';
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      alert('Unable to export members: ' + error.message);
+    }
   };
 
   // Member Management
@@ -2691,7 +2727,7 @@ function initAdminConsole() {
     try {
       const res = await apiFetch('/api/admin/members', {
         headers: {
-          'X-Admin-Key': sessionAdminPin || 'admin2026'
+          'X-Admin-Key': sessionAdminPin || ''
         }
       });
       if (!res.ok) throw new Error('Failed to fetch members with admin credentials');
@@ -2786,8 +2822,8 @@ function initAdminConsole() {
 
   window.toggleMemberStatus = async function(passId, newStatus) {
     try {
-      const pin = sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || window.sessionAdminPin || 'admin2026';
-      const res = await apiFetch(`/api/admin/members/${encodeURIComponent(passId)}/status?pin=${encodeURIComponent(pin)}`, {
+      const pin = sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || window.sessionAdminPin || '';
+      const res = await apiFetch(`/api/admin/members/${encodeURIComponent(passId)}/status`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -2820,8 +2856,8 @@ This will remove the record from SQLite database associationhub.db.`)) {
     }
 
     try {
-      const pin = sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || window.sessionAdminPin || 'admin2026';
-      const res = await apiFetch(`/api/memberships/${encodeURIComponent(passId)}?pin=${encodeURIComponent(pin)}`, {
+      const pin = sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || window.sessionAdminPin || '';
+      const res = await apiFetch(`/api/memberships/${encodeURIComponent(passId)}`, {
         method: 'DELETE',
         headers: {
           'X-Admin-Key': pin,
@@ -2969,8 +3005,8 @@ This will remove the record from SQLite database associationhub.db.`)) {
     try {
       const res = await apiFetch('/api/admin/chat/users', {
         headers: {
-          'X-Admin-Key': sessionAdminPin || 'admin2026',
-          'X-Admin-Token': sessionAdminToken || sessionAdminPin || 'admin2026'
+          'X-Admin-Key': sessionAdminPin || '',
+          'X-Admin-Token': sessionAdminToken || sessionAdminPin || ''
         }
       });
       if (!res.ok) throw new Error('Failed to load chat users');
@@ -3061,8 +3097,8 @@ This will remove the record from SQLite database associationhub.db.`)) {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          'X-Admin-Key': sessionAdminPin || 'admin2026',
-          'X-Admin-Token': sessionAdminToken || sessionAdminPin || 'admin2026'
+          'X-Admin-Key': sessionAdminPin || '',
+          'X-Admin-Token': sessionAdminToken || sessionAdminPin || ''
         },
         body: JSON.stringify({ status: newStatus })
       });
@@ -3084,8 +3120,8 @@ This will remove the record from SQLite database associationhub.db.`)) {
       const res = await apiFetch(`/api/admin/chat/users/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
         headers: {
-          'X-Admin-Key': sessionAdminPin || 'admin2026',
-          'X-Admin-Token': sessionAdminToken || sessionAdminPin || 'admin2026'
+          'X-Admin-Key': sessionAdminPin || '',
+          'X-Admin-Token': sessionAdminToken || sessionAdminPin || ''
         }
       });
       const data = await res.json();
@@ -3102,7 +3138,9 @@ This will remove the record from SQLite database associationhub.db.`)) {
 
   window.adminUnmaskAuthor = async function(postId) {
     try {
-      const res = await apiFetch(`/api/admin/community/unmask/${encodeURIComponent(postId)}?admin_key=${encodeURIComponent(sessionAdminPin)}`);
+      const res = await apiFetch(`/api/admin/community/unmask/${encodeURIComponent(postId)}`, {
+        headers: { 'X-Admin-Key': sessionAdminPin || '' }
+      });
       const data = await res.json();
       if (res.ok) {
         alert(`CONFIDENTIAL UNMASK AUDIT:\n\nTitle: "${data.title}"\nTrue Student: ${data.true_student_name}\nRoll No / PRN: ${data.true_roll_no}\nVerified Gmail: ${data.verified_gmail || 'Not Recorded'}\nBranch: ${data.department}\nYear: ${data.year}\nTimestamp: ${data.timestamp}`);
@@ -3230,38 +3268,29 @@ This will remove the record from SQLite database associationhub.db.`)) {
     const indicator = document.getElementById('smtp-status-indicator');
     const title = document.getElementById('smtp-status-title');
     const subtitle = document.getElementById('smtp-status-subtitle');
-    const userInput = document.getElementById('smtp-config-user');
-    const hostInput = document.getElementById('smtp-config-host');
-    const portInput = document.getElementById('smtp-config-port');
-    const fromInput = document.getElementById('smtp-config-from');
 
     try {
       const res = await apiFetch('/api/admin/smtp-config', {
         headers: {
-          'X-Admin-Key': sessionAdminPin || 'admin2026',
-          'X-Admin-Token': sessionAdminToken || sessionAdminPin || 'admin2026'
+          'X-Admin-Key': sessionAdminPin || '',
+          'X-Admin-Token': sessionAdminToken || sessionAdminPin || ''
         }
       });
       if (!res.ok) throw new Error('Failed to fetch SMTP configuration');
       const data = await res.json();
 
-      if (userInput && data.user) userInput.value = data.user;
-      if (hostInput && data.host) hostInput.value = data.host;
-      if (portInput && data.port) portInput.value = data.port;
-      if (fromInput && data.from_name) fromInput.value = data.from_name;
-
       if (data.configured) {
         if (indicator) indicator.style.background = '#00e676';
         if (title) title.innerHTML = `🟢 Live Gmail SMTP Active &bull; <span style="font-family:var(--font-mono); color:var(--brand-gold);">${data.user}</span>`;
-        if (subtitle) subtitle.textContent = `Real-time OTP delivery is ACTIVE via ${data.host}:${data.port}. Password masked: ${data.masked_password}`;
+        if (subtitle) subtitle.textContent = `Real-time OTP delivery is active via ${data.host}:${data.port}. Credentials are configured on the server.`;
         if (statusCard) {
           statusCard.style.background = 'rgba(0, 230, 118, 0.08)';
           statusCard.style.border = '1px solid rgba(0, 230, 118, 0.3)';
         }
       } else {
         if (indicator) indicator.style.background = '#ff9800';
-        if (title) title.textContent = '🟡 Real SMTP Not Configured (Using Dev Fallback)';
-        if (subtitle) subtitle.textContent = 'Enter your Gmail & 16-character Google App Password below to send real OTP emails to student inboxes.';
+        if (title) title.textContent = '🟡 SMTP is not configured';
+        if (subtitle) subtitle.textContent = 'OTP email delivery is unavailable. Configure SMTP_USER and SMTP_PASSWORD in the server environment and restart the backend.';
         if (statusCard) {
           statusCard.style.background = 'rgba(229, 169, 60, 0.08)';
           statusCard.style.border = '1px solid var(--color-border-subtle)';
@@ -3270,77 +3299,6 @@ This will remove the record from SQLite database associationhub.db.`)) {
     } catch (err) {
       if (title) title.textContent = '⚠️ Unable to query SMTP status';
       if (subtitle) subtitle.textContent = err.message;
-    }
-  };
-
-  window.saveAdminSmtpConfig = async function(event) {
-    event.preventDefault();
-    const user = (document.getElementById('smtp-config-user')?.value || '').trim();
-    const pass = (document.getElementById('smtp-config-pass')?.value || '').trim();
-    const host = (document.getElementById('smtp-config-host')?.value || '').trim() || 'smtp.gmail.com';
-    const port = parseInt(document.getElementById('smtp-config-port')?.value || '587');
-    const fromName = (document.getElementById('smtp-config-from')?.value || '').trim() || 'NKOCET Solapur Verification Gateway';
-    const msgEl = document.getElementById('smtp-save-msg');
-    const saveBtn = document.getElementById('btn-save-smtp');
-
-    if (!user || !pass) {
-      if (msgEl) {
-        msgEl.style.display = 'block';
-        msgEl.style.color = '#ff5252';
-        msgEl.textContent = 'Please enter both Sender Gmail and 16-character App Password.';
-      }
-      return;
-    }
-
-    if (saveBtn) {
-      saveBtn.disabled = true;
-      saveBtn.innerHTML = '<span>Saving & Testing... ⏳</span>';
-    }
-
-    try {
-      const res = await apiFetch('/api/admin/smtp-config', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Admin-Key': sessionAdminPin || 'admin2026',
-          'X-Admin-Token': sessionAdminToken || sessionAdminPin || 'admin2026'
-        },
-        body: JSON.stringify({
-          user: user,
-          password: pass,
-          host: host,
-          port: port,
-          from_name: fromName
-        })
-      });
-      const data = await res.json();
-
-      if (res.ok) {
-        if (msgEl) {
-          msgEl.style.display = 'block';
-          msgEl.style.color = '#00e676';
-          msgEl.innerHTML = `✓ ${data.message}`;
-        }
-        if (typeof showToast === 'function') showToast('Gmail SMTP settings saved successfully!', 'success');
-        loadAdminSmtpConfig();
-      } else {
-        if (msgEl) {
-          msgEl.style.display = 'block';
-          msgEl.style.color = '#ff5252';
-          msgEl.textContent = data.detail || 'Failed to save SMTP settings.';
-        }
-      }
-    } catch (err) {
-      if (msgEl) {
-        msgEl.style.display = 'block';
-        msgEl.style.color = '#ff5252';
-        msgEl.textContent = 'Connection error: ' + err.message;
-      }
-    } finally {
-      if (saveBtn) {
-        saveBtn.disabled = false;
-        saveBtn.innerHTML = '<span>Save SMTP Credentials 💾</span>';
-      }
     }
   };
 
@@ -3372,8 +3330,8 @@ This will remove the record from SQLite database associationhub.db.`)) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Admin-Key': sessionAdminPin || 'admin2026',
-          'X-Admin-Token': sessionAdminToken || sessionAdminPin || 'admin2026'
+          'X-Admin-Key': sessionAdminPin || '',
+          'X-Admin-Token': sessionAdminToken || sessionAdminPin || ''
         },
         body: JSON.stringify({ test_email: email })
       });
@@ -3718,6 +3676,7 @@ function initSpotlightSearch() {
       sendBtn.innerHTML = `<span>Dispatching OTP via Gmail... ⏳</span>`;
     }
 
+    const sessionId = window.createVerificationSessionId();
     try {
       const res = await apiFetch('/api/student/register/send-otp', {
         method: 'POST',
@@ -3728,7 +3687,8 @@ function initSpotlightSearch() {
           email: email,
           dept: dept,
           password: password,
-          confirm_password: confirmPassword
+          confirm_password: confirmPassword,
+          session_id: sessionId
         })
       });
 
@@ -3749,7 +3709,8 @@ function initSpotlightSearch() {
         roll_no: roll,
         email,
         dept,
-        password
+        password,
+        session_id: sessionId
       };
 
       // Transition to Step 2
@@ -3868,7 +3829,8 @@ function initSpotlightSearch() {
           email: pendingStudentData.email,
           dept: pendingStudentData.dept,
           password: pendingStudentData.password,
-          confirm_password: pendingStudentData.password
+          confirm_password: pendingStudentData.password,
+          session_id: pendingStudentData.session_id
         })
       });
 
@@ -3927,7 +3889,8 @@ function initSpotlightSearch() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: pendingStudentData.email,
-          otp: otp
+          otp: otp,
+          session_id: pendingStudentData.session_id
         })
       });
 
@@ -3960,7 +3923,8 @@ function initSpotlightSearch() {
           roll_no: pendingStudentData.roll_no,
           dept: pendingStudentData.dept,
           password: pendingStudentData.password,
-          verification_token: verifyData.verification_token
+          verification_token: verifyData.verification_token,
+          session_id: pendingStudentData.session_id
         })
       });
 
@@ -4018,7 +3982,7 @@ function initSpotlightSearch() {
     try {
       const res = await apiFetch('/api/admin/students', {
         headers: {
-          'X-Admin-Pin': (window.sessionAdminPin || 'admin2026')
+          'X-Admin-Pin': (window.sessionAdminPin || '')
         }
       });
       const data = await res.json();
@@ -4086,7 +4050,7 @@ function initSpotlightSearch() {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          'X-Admin-Pin': (window.sessionAdminPin || 'admin2026')
+          'X-Admin-Pin': (window.sessionAdminPin || '')
         },
         body: JSON.stringify({ status: newStatus })
       });
@@ -4115,7 +4079,7 @@ function initSpotlightSearch() {
       const res = await apiFetch(`/api/admin/students/${encodeURIComponent(studentId)}`, {
         method: 'DELETE',
         headers: {
-          'X-Admin-Pin': (window.sessionAdminPin || 'admin2026')
+          'X-Admin-Pin': (window.sessionAdminPin || '')
         }
       });
       const data = await res.json();
@@ -4135,7 +4099,7 @@ function initSpotlightSearch() {
 
   // Administrator Authority: Export Registry as CSV
   window.exportStudentsCsv = function() {
-    const pin = window.sessionAdminPin || 'admin2026';
+    const pin = window.sessionAdminPin || '';
     apiFetch('/api/admin/export/students.csv', {
       headers: { 'X-Admin-Pin': pin }
     })
@@ -4164,7 +4128,7 @@ function initSpotlightSearch() {
     const badge = document.getElementById('admin-rejoin-count-badge');
     if (!badge) return;
     try {
-      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || 'admin2026';
+      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || '';
       const res = await apiFetch('/api/admin/rejoin-requests', {
         headers: { 'X-Admin-Pin': pin }
       });
@@ -4192,7 +4156,7 @@ function initSpotlightSearch() {
     tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading rejoining approval queue...</td></tr>`;
 
     try {
-      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || 'admin2026';
+      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || '';
       const res = await apiFetch('/api/admin/rejoin-requests', {
         headers: {
           'X-Admin-Pin': pin
@@ -4277,7 +4241,7 @@ function initSpotlightSearch() {
     }
 
     try {
-      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || 'admin2026';
+      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || '';
       const res = await apiFetch(`/api/admin/rejoin-requests/${requestId}/approve`, {
         method: 'POST',
         headers: {
@@ -4308,7 +4272,7 @@ function initSpotlightSearch() {
     }
 
     try {
-      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || 'admin2026';
+      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || '';
       const res = await apiFetch(`/api/admin/rejoin-requests/${requestId}/reject`, {
         method: 'POST',
         headers: {
@@ -4414,8 +4378,8 @@ function initSpotlightSearch() {
     }
 
     try {
-      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || 'admin2026';
-      const res = await apiFetch(`/api/admin/events?pin=${encodeURIComponent(pin)}`, {
+      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || '';
+      const res = await apiFetch('/api/admin/events', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -4475,8 +4439,8 @@ function initSpotlightSearch() {
     if (!confirm(`Remove event "${title}" from the active campus schedule?\n\nThis will remove it from all collegiate portals and the live event calendar.`)) return;
 
     try {
-      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || 'admin2026';
-      const res = await apiFetch(`/api/admin/events/${eventId}?pin=${encodeURIComponent(pin)}`, {
+      const pin = window.sessionAdminPin || sessionStorage.getItem('orchid_admin_pin') || '';
+      const res = await apiFetch(`/api/admin/events/${eventId}`, {
         method: 'DELETE',
         headers: {
           'X-Admin-Pin': pin
