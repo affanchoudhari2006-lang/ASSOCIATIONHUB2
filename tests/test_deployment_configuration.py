@@ -202,10 +202,44 @@ class RenderDeploymentConfigurationTests(unittest.TestCase):
         }
         with patch.dict(os.environ, environment, clear=True):
             with patch.object(server.smtplib, "SMTP", side_effect=server.smtplib.SMTPAuthenticationError(535, b"internal detail")):
-                result = server.send_real_smtp_email("student@college.edu", "Student", "123456")
+                with self.assertLogs("associationhub.smtp", level="ERROR") as captured:
+                    result = server.send_real_smtp_email("student@college.edu", "Student", "123456")
         self.assertFalse(result["sent"])
         self.assertNotIn("internal detail", result["reason"])
         self.assertEqual(result["reason"], "SMTP authentication failed")
+        smtp_log = "\n".join(captured.output)
+        self.assertIn("SMTPAuthenticationError", smtp_log)
+        self.assertIn("535", smtp_log)
+        self.assertIn("internal detail", smtp_log)
+
+    def test_smtp_diagnostic_log_redacts_secrets_and_message_content(self):
+        environment = {
+            "ADMIN_SECRET_PIN": secrets.token_urlsafe(24),
+            "NKOCET_CRYPTO_SECRET": secrets.token_hex(32),
+            "SMTP_USER": "sender@college.edu",
+            "SMTP_PASSWORD": "gmail-app-password-secret",
+            "SMTP_HOST": "smtp.gmail.com",
+            "SMTP_PORT": "587",
+        }
+        failure = RuntimeError(
+            "password=gmail-app-password-secret sender@college.edu otp=123456 recipient student@college.edu"
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            with patch.object(server.smtplib, "SMTP", side_effect=failure):
+                with self.assertLogs("associationhub.smtp", level="ERROR") as captured:
+                    result = server.send_real_smtp_email(
+                        "student@college.edu",
+                        "Student",
+                        "123456",
+                    )
+
+        self.assertFalse(result["sent"])
+        smtp_log = "\n".join(captured.output)
+        self.assertIn("RuntimeError", smtp_log)
+        self.assertNotIn("gmail-app-password-secret", smtp_log)
+        self.assertNotIn("sender@college.edu", smtp_log)
+        self.assertNotIn("student@college.edu", smtp_log)
+        self.assertNotIn("123456", smtp_log)
 
         original_db_path = server.DB_PATH
         original_crypto_secret = server.NKOCET_CRYPTO_SECRET
@@ -247,10 +281,10 @@ class RenderDeploymentConfigurationTests(unittest.TestCase):
                     }):
                         with self.assertRaises(HTTPException) as raised:
                             asyncio.run(server.student_register_send_otp(data, request))
-                self.assertEqual(raised.exception.status_code, 503)
+                self.assertEqual(raised.exception.status_code, 410)
                 self.assertEqual(
                     raised.exception.detail,
-                    "Verification email could not be sent. Please try again later.",
+                    "Student Gmail OTP registration has been removed.",
                 )
                 with closing(sqlite3.connect(server.DB_PATH)) as conn:
                     self.assertEqual(
@@ -271,7 +305,7 @@ class RenderDeploymentConfigurationTests(unittest.TestCase):
                         "SELECT otp_code, is_verified FROM email_otp_verifications WHERE email = ?",
                         ("new-student@college.edu",),
                     ).fetchone()
-                self.assertEqual(tuple(verification), ("", 0))
+                self.assertIsNone(verification)
             finally:
                 server.DB_PATH = original_db_path
                 server.NKOCET_CRYPTO_SECRET = original_crypto_secret

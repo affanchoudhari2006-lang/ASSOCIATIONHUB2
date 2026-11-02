@@ -759,10 +759,10 @@
           NKOCET Verified Student Chat Gateway
         </h3>
         <p style="color: var(--color-text-muted); font-size: 0.88rem; line-height: 1.55; margin-bottom: 1.5rem; max-width: 520px; margin-left: auto; margin-right: auto;">
-          To prevent spam and maintain verified discussions across all 6 engineering departments, you must register your student identity and verify your Gmail via OTP to enter.
+          Enter your student identity to join Campus Pulse community discussions across all 6 engineering departments.
         </p>
 
-        <form id="chat-gateway-form" onsubmit="event.preventDefault();" style="text-align: left;">
+        <form id="chat-gateway-form" onsubmit="event.preventDefault(); enterChatGateway();" style="text-align: left;">
           <div class="form-group-grid" style="margin-bottom: 0.85rem;">
             <div class="form-group" style="margin-bottom: 0;">
               <label class="form-label">Full Name *</label>
@@ -791,28 +791,12 @@
               <span>Official Student Gmail *</span>
               <span style="font-size: 0.72rem; color: var(--brand-gold);">(Admin Authority Confidential)</span>
             </label>
-            <div style="display: flex; gap: 0.5rem;">
-              <input type="email" id="gate-email" class="form-input" placeholder="e.g. yourname@gmail.com" style="flex: 1;" required>
-              <button type="button" id="gate-btn-send-otp" class="btn-secondary" onclick="sendChatGatewayOtp()" style="padding: 0.55rem 1.1rem; font-size: 0.82rem; white-space: nowrap;">
-                <span>Send OTP ✉️</span>
-              </button>
-            </div>
+            <input type="email" id="gate-email" class="form-input" placeholder="e.g. yourname@gmail.com" required>
           </div>
 
-          <!-- Inline OTP Verification Box -->
-          <div id="gate-otp-box" style="display: none; background: rgba(22, 135, 255, 0.08); border: 1px solid rgba(22, 135, 255, 0.3); border-radius: var(--radius-sm); padding: 0.85rem; margin-bottom: 1rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; margin-bottom: 0.4rem;">
-              <span style="color: var(--color-text-secondary);">Enter 6-digit verification code from Gmail:</span>
-              <span id="gate-otp-timer" style="color: var(--brand-gold); font-family: var(--font-mono); font-weight: 700;">10:00</span>
-            </div>
-            <div style="display: flex; gap: 0.5rem; align-items: center;">
-              <input type="text" id="gate-otp-code" class="form-input" placeholder="6-Digit OTP" maxlength="6" style="letter-spacing: 0.25rem; font-family: var(--font-mono); text-align: center; max-width: 140px;">
-              <button type="button" id="gate-btn-verify" class="btn-primary" onclick="verifyAndEnterChatGateway()" style="padding: 0.55rem 1.25rem; font-size: 0.82rem;">
-                <span>Verify & Unlock Chat 🚀</span>
-              </button>
-            </div>
-            <div id="gate-otp-hint" style="display: none; font-size: 0.72rem; color: var(--brand-gold); margin-top: 0.4rem; font-family: var(--font-mono);"></div>
-          </div>
+          <button type="submit" id="gate-btn-enter" class="btn-primary" style="width: 100%; justify-content: center; padding: 0.85rem; font-weight: 700;">
+            <span>Enter Community Chat 🚀</span>
+          </button>
           <div id="gate-error-msg" style="display: none; color: #ff5252; font-size: 0.82rem; margin-top: 0.5rem; text-align: center;"></div>
         </form>
       </div>
@@ -1153,9 +1137,7 @@
     </div>
   </div>
 
-  <!-- =========================================================================
-       7.55 COMPLETE STUDENT REGISTRATION & REAL-TIME GMAIL OTP VERIFICATION GATE
-       ========================================================================= -->
+  <!-- STUDENT REGISTRATION -->
   <div id="student-register-modal-overlay" class="membership-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="student-reg-modal-title">
     <div class="membership-modal" style="max-width: 580px;">
       <button type="button" class="membership-modal-close" onclick="closeStudentRegisterModal()" aria-label="Close modal">✕</button>
@@ -1165,12 +1147,12 @@
         <span class="quiz-badge" style="margin-bottom: 0.75rem; background: rgba(25, 214, 140, 0.15); color: #19D68C; border-color: rgba(25, 214, 140, 0.3);">Official Student Registration</span>
         <h2 id="student-reg-modal-title" class="membership-modal-title">New Student Registration</h2>
         <p class="membership-modal-subtitle">
-          Create your verified NKOCET student account. An actual 6-digit OTP verification code will be dispatched to your exact Gmail address in real-time before registration can be completed.
+          Create your NKOCET student account using your email address.
         </p>
 
         <div id="student-reg-alert-1" style="display: none; padding: 0.65rem 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-size: 0.88rem;"></div>
 
-        <form id="student-registration-form" onsubmit="handleStudentSendOtp(event)">
+        <form id="student-registration-form" onsubmit="handleStudentRegistration(event)">
           <div class="form-group-grid">
             <div class="form-group">
               <label for="student-reg-name" class="form-label">Full Name *</label>
@@ -1185,9 +1167,6 @@
           <div class="form-group">
             <label for="student-reg-email" class="form-label">Official Gmail Address *</label>
             <input type="email" id="student-reg-email" class="form-input" placeholder="e.g. yourname@gmail.com" required>
-            <span style="font-size: 0.72rem; color: var(--color-text-secondary); margin-top: 0.25rem; display: block;">
-              ✉️ Real email delivery: A unique 6-digit OTP will be dispatched directly to this inbox.
-            </span>
           </div>
 
           <div class="form-group">
@@ -1214,45 +1193,11 @@
             </div>
           </div>
 
-          <button type="submit" id="btn-student-send-otp" class="btn-primary" style="width: 100%; justify-content: center; margin-top: 1rem; padding: 0.85rem; font-size: 0.95rem; font-weight: 700;">
-            <span>Send Verification OTP ✉️</span>
+          <button type="submit" id="btn-student-register" class="btn-primary" style="width: 100%; justify-content: center; margin-top: 1rem; padding: 0.85rem; font-size: 0.95rem; font-weight: 700;">
+            <span>Create Student Account</span>
             <span>→</span>
           </button>
         </form>
-      </div>
-
-      <!-- STEP 2: REAL-TIME GMAIL OTP VERIFICATION GATE -->
-      <div id="student-reg-step-2" style="display: none;">
-        <span class="quiz-badge" style="margin-bottom: 0.75rem; background: rgba(229, 169, 60, 0.15); color: #E5A93C; border-color: rgba(229, 169, 60, 0.3);">Gmail Security Verification Gate</span>
-        <h2 class="membership-modal-title">Enter Verification Code</h2>
-        <p class="membership-modal-subtitle" style="margin-bottom: 1.15rem;">
-          We dispatched an actual 6-digit verification OTP to your Gmail address:<br>
-          <strong id="student-reg-masked-email" style="color: #19D68C; font-size: 1.15rem; display: inline-block; margin-top: 0.35rem; font-family: var(--font-mono); letter-spacing: 0.05rem;"></strong>
-        </p>
-
-        <div id="student-reg-alert-2" style="display: none; padding: 0.65rem 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-size: 0.88rem;"></div>
-
-        <div style="background: rgba(13, 18, 32, 0.65); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-sm); padding: 1.35rem; text-align: center;">
-          <label for="student-reg-otp" class="form-label" style="text-align: center; margin-bottom: 0.65rem; color: var(--color-text-secondary);">
-            6-Digit Verification Code
-          </label>
-          <input type="text" id="student-reg-otp" class="form-input" maxlength="6" placeholder="• • • • • •" style="font-size: 2rem; letter-spacing: 0.65rem; text-align: center; font-family: var(--font-mono); font-weight: 800; max-width: 250px; margin: 0 auto; display: block; border-color: #19D68C; background: rgba(0, 0, 0, 0.45);" autocomplete="one-time-code">
-          <div style="font-size: 0.76rem; color: #94a3b8; margin-top: 0.5rem;">
-            📋 Tip: You can paste the complete 6-digit OTP directly into this field.
-          </div>
-
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1.25rem; padding: 0.65rem 0.85rem; background: rgba(255, 255, 255, 0.03); border-radius: var(--radius-sm); border: 1px solid var(--color-border-subtle); flex-wrap: wrap; gap: 0.5rem;">
-            <span id="student-reg-timer" style="font-family: var(--font-mono); color: #E5A93C; font-weight: 700; font-size: 0.85rem;">⏱️ Expires in: 05:00</span>
-            <button type="button" id="btn-student-reg-resend" class="btn-secondary" onclick="handleStudentRegResendOtp()" style="padding: 0.35rem 0.8rem; font-size: 0.78rem;">Resend OTP ✉️</button>
-          </div>
-
-          <button type="button" id="btn-student-reg-verify" class="btn-primary" onclick="handleStudentRegVerifyAndComplete()" style="width: 100%; justify-content: center; padding: 0.85rem; margin-top: 1.25rem; font-size: 0.95rem; font-weight: 700;">
-            <span>Verify OTP & Complete Registration ✓</span>
-          </button>
-          <button type="button" class="btn-secondary" onclick="backToStudentRegForm()" style="width: 100%; justify-content: center; padding: 0.5rem; margin-top: 0.6rem; font-size: 0.8rem;">
-            <span>← Edit Registration Details</span>
-          </button>
-        </div>
       </div>
 
       <!-- STEP 3: REGISTRATION SUCCESS SCREEN -->
@@ -1260,7 +1205,7 @@
         <div style="width: 64px; height: 64px; border-radius: 50%; background: rgba(25, 214, 140, 0.15); border: 2px solid #19D68C; display: inline-flex; align-items: center; justify-content: center; font-size: 2rem; color: #19D68C; margin-bottom: 1rem;">✓</div>
         <h2 class="membership-modal-title" style="color: #19D68C; margin-bottom: 0.35rem;">Account Successfully Registered!</h2>
         <p class="membership-modal-subtitle" style="margin-bottom: 1.2rem;">
-          Your Gmail address has been verified and your official student profile is permanently recorded in the database.
+          Your official student profile has been recorded in the database.
         </p>
 
         <div style="background: rgba(13, 18, 32, 0.75); border: 1px solid rgba(25, 214, 140, 0.3); border-radius: var(--radius-sm); padding: 1.25rem; text-align: left; margin-bottom: 1.25rem;">
@@ -1273,7 +1218,7 @@
             <strong id="success-student-name"></strong>
           </div>
           <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.85rem;">
-            <span style="color: var(--color-text-secondary);">Verified Gmail:</span>
+            <span style="color: var(--color-text-secondary);">Email Address:</span>
             <strong id="success-student-email" style="color: #19D68C;"></strong>
           </div>
           <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.85rem;">
@@ -1283,14 +1228,6 @@
           <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.85rem;">
             <span style="color: var(--color-text-secondary);">Department:</span>
             <strong id="success-student-dept"></strong>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.85rem;">
-            <span style="color: var(--color-text-secondary);">Verification Status:</span>
-            <span style="color: #19D68C; font-weight: 700;">✅ VERIFIED (100%)</span>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.85rem;">
-            <span style="color: var(--color-text-secondary);">Verification Time:</span>
-            <span id="success-student-verified-at" style="font-family: var(--font-mono); font-size: 0.8rem; color: #cbd5e1;"></span>
           </div>
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
             <span style="color: var(--color-text-secondary);">Account Created:</span>
