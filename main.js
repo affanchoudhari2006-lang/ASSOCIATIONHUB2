@@ -1731,10 +1731,6 @@ function initCampusPulse() {
   let _pulseRealtimeTimer = null;
   let _isSyncingPosts = false;
   let _currentChatUser = null;
-  let chatOtpSessionId = null;
-  let _gateOtpTimer = null;
-  let _gateOtpSeconds = 600;
-
   // Real-Time Background Synchronization Engine (Silent Auto-Sync every 3 seconds)
   async function syncRealtimeCommunityPosts() {
     if (_isSyncingPosts || !grid) return;
@@ -1836,15 +1832,13 @@ function initCampusPulse() {
     _currentChatUser = null;
   }
 
-  window.sendChatGatewayOtp = async function() {
+  window.enterChatGateway = async function() {
     const name = (document.getElementById('gate-name')?.value || '').trim();
     const roll = (document.getElementById('gate-roll')?.value || '').trim().toUpperCase();
     const dept = (document.getElementById('gate-dept')?.value || '').trim();
     const email = (document.getElementById('gate-email')?.value || '').trim().toLowerCase();
     const errEl = document.getElementById('gate-error-msg');
-    const sendBtn = document.getElementById('gate-btn-send-otp');
-    const otpBox = document.getElementById('gate-otp-box');
-    const otpHint = document.getElementById('gate-otp-hint');
+    const enterBtn = document.getElementById('gate-btn-enter');
 
     if (errEl) errEl.style.display = 'none';
 
@@ -1857,118 +1851,13 @@ function initCampusPulse() {
       return;
     }
     if (!email || !email.includes('@') || !email.includes('.')) {
-      if (errEl) { errEl.textContent = 'Please enter a valid student Gmail address.'; errEl.style.display = 'block'; }
+      if (errEl) { errEl.textContent = 'Please enter a valid email address.'; errEl.style.display = 'block'; }
       return;
     }
 
-    if (sendBtn) {
-      sendBtn.disabled = true;
-      sendBtn.innerHTML = '<span>Sending... ⏳</span>';
-    }
-
-    chatOtpSessionId = window.createVerificationSessionId();
-    try {
-      const res = await apiFetch('/api/chat/auth/send-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email,
-          name: name,
-          roll_no: roll,
-          session_id: chatOtpSessionId
-        })
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        if (otpBox) otpBox.style.display = 'block';
-        if (typeof showToast === 'function') showToast(`Verification OTP sent to ${email}`, 'success');
-
-        if (otpHint) {
-          otpHint.style.display = 'block';
-          otpHint.style.color = '#00e676';
-          otpHint.innerHTML = `📧 <strong>Verification code dispatched to ${email}!</strong> Check your Gmail inbox (or Spam folder) for the 6-digit code.`;
-        }
-        const codeInput = document.getElementById('gate-otp-code');
-        if (codeInput) {
-          codeInput.value = '';
-          codeInput.focus();
-        }
-
-        // 5-minute (300s) expiry timer
-        _gateOtpSeconds = 300;
-        clearInterval(_gateOtpTimer);
-        const timerEl = document.getElementById('gate-otp-timer');
-        _gateOtpTimer = setInterval(() => {
-          _gateOtpSeconds--;
-          if (_gateOtpSeconds <= 0) {
-            clearInterval(_gateOtpTimer);
-            if (timerEl) timerEl.textContent = 'Expired';
-          } else {
-            const m = Math.floor(_gateOtpSeconds / 60);
-            const s = _gateOtpSeconds % 60;
-            if (timerEl) timerEl.textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
-          }
-        }, 1000);
-
-        // 60-second resend cooldown
-        let cooldown = 60;
-        sendBtn.disabled = true;
-        sendBtn.innerHTML = `<span>Resend in ${cooldown}s ⏳</span>`;
-        if (window._gateCooldownInterval) clearInterval(window._gateCooldownInterval);
-        window._gateCooldownInterval = setInterval(() => {
-          cooldown--;
-          if (cooldown <= 0) {
-            clearInterval(window._gateCooldownInterval);
-            sendBtn.disabled = false;
-            sendBtn.innerHTML = `<span>Resend OTP ✉️</span>`;
-          } else {
-            sendBtn.innerHTML = `<span>Resend in ${cooldown}s ⏳</span>`;
-          }
-        }, 1000);
-
-        return;
-      } else {
-        if (errEl) {
-          errEl.textContent = data.detail || 'Failed to send OTP.';
-          errEl.style.display = 'block';
-        }
-        if (sendBtn) {
-          sendBtn.disabled = false;
-          sendBtn.innerHTML = '<span>Send OTP ✉️</span>';
-        }
-      }
-    } catch (e) {
-      if (errEl) {
-        errEl.textContent = 'Connection error: ' + e.message;
-        errEl.style.display = 'block';
-      }
-      if (sendBtn) {
-        sendBtn.disabled = false;
-        sendBtn.innerHTML = '<span>Send OTP ✉️</span>';
-      }
-    }
-  };
-
-  window.verifyAndEnterChatGateway = async function() {
-    const name = (document.getElementById('gate-name')?.value || '').trim();
-    const roll = (document.getElementById('gate-roll')?.value || '').trim().toUpperCase();
-    const dept = (document.getElementById('gate-dept')?.value || '').trim();
-    const email = (document.getElementById('gate-email')?.value || '').trim().toLowerCase();
-    const otp = (document.getElementById('gate-otp-code')?.value || '').trim();
-    const errEl = document.getElementById('gate-error-msg');
-    const verifyBtn = document.getElementById('gate-btn-verify');
-
-    if (errEl) errEl.style.display = 'none';
-
-    if (!otp || otp.length !== 6) {
-      if (errEl) { errEl.textContent = 'Please enter the 6-digit OTP code.'; errEl.style.display = 'block'; }
-      return;
-    }
-
-    if (verifyBtn) {
-      verifyBtn.disabled = true;
-      verifyBtn.innerHTML = '<span>Verifying... ⏳</span>';
+    if (enterBtn) {
+      enterBtn.disabled = true;
+      enterBtn.innerHTML = '<span>Entering... ⏳</span>';
     }
 
     try {
@@ -1979,9 +1868,7 @@ function initCampusPulse() {
           name: name,
           roll_no: roll,
           dept: dept,
-          email: email,
-          otp: otp,
-          session_id: chatOtpSessionId
+          email: email
         })
       });
 
@@ -1999,7 +1886,7 @@ function initCampusPulse() {
         loadCommunityPosts();
       } else {
         if (errEl) {
-          errEl.textContent = data.detail || 'Verification failed.';
+          errEl.textContent = data.detail || 'Unable to enter chat.';
           errEl.style.display = 'block';
         }
       }
@@ -2009,9 +1896,9 @@ function initCampusPulse() {
         errEl.style.display = 'block';
       }
     } finally {
-      if (verifyBtn) {
-        verifyBtn.disabled = false;
-        verifyBtn.innerHTML = '<span>Verify & Unlock Chat 🚀</span>';
+      if (enterBtn) {
+        enterBtn.disabled = false;
+        enterBtn.innerHTML = '<span>Enter Community Chat 🚀</span>';
       }
     }
   };
@@ -2030,7 +1917,7 @@ function initCampusPulse() {
       const token = localStorage.getItem('orchid_chat_token') || sessionStorage.getItem('orchid_chat_token');
       if (!token) {
         if (typeof showToast === 'function') {
-          showToast('Please register and verify your Gmail below first to join the chat.', 'error');
+          showToast('Please enter your student details below to join the chat.', 'error');
         }
         const lockSec = document.getElementById('chat-gateway-locked');
         if (lockSec) lockSec.scrollIntoView({ behavior: 'smooth' });
@@ -3524,9 +3411,7 @@ function initSpotlightSearch() {
   }
 }
 
-// =========================================================================
-// NEW STUDENT REGISTRATION & REAL-TIME GMAIL OTP VERIFICATION GATEWAY
-// =========================================================================
+// STUDENT REGISTRATION
 
 (function initStudentRegistrationSystem() {
   let studentOtpTimer = null;
@@ -3637,8 +3522,8 @@ function initSpotlightSearch() {
     }
   });
 
-  // Step 1: Send Real Gmail OTP
-  window.handleStudentSendOtp = async function(event) {
+  // Direct student registration
+  window.handleStudentRegistration = async function(event) {
     if (event) event.preventDefault();
 
     const name = (document.getElementById('student-reg-name')?.value || '').trim();
@@ -3647,7 +3532,7 @@ function initSpotlightSearch() {
     const dept = (document.getElementById('student-reg-dept')?.value || '').trim();
     const password = document.getElementById('student-reg-password')?.value || '';
     const confirmPassword = document.getElementById('student-reg-confirm-password')?.value || '';
-    const sendBtn = document.getElementById('btn-student-send-otp');
+    const submitBtn = document.getElementById('btn-student-register');
 
     hideAlert('student-reg-alert-1');
 
@@ -3671,309 +3556,54 @@ function initSpotlightSearch() {
       return;
     }
 
-    if (sendBtn) {
-      sendBtn.disabled = true;
-      sendBtn.innerHTML = `<span>Dispatching OTP via Gmail... ⏳</span>`;
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span>Creating Student Account... ⏳</span>';
     }
 
-    const sessionId = window.createVerificationSessionId();
     try {
-      const res = await apiFetch('/api/student/register/send-otp', {
+      const res = await apiFetch('/api/student/register/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: name,
+          name,
           roll_no: roll,
-          email: email,
-          dept: dept,
-          password: password,
-          confirm_password: confirmPassword,
-          session_id: sessionId
+          email,
+          dept,
+          password
         })
       });
-
       const data = await res.json();
-
       if (!res.ok) {
-        showAlert('student-reg-alert-1', `⚠️ ${escapeHtml(data.detail || 'Unable to send verification OTP.')}`);
-        if (sendBtn) {
-          sendBtn.disabled = false;
-          sendBtn.innerHTML = `<span>Send Verification OTP ✉️</span><span>→</span>`;
-        }
+        showAlert('student-reg-alert-1', `⚠️ ${escapeHtml(data.detail || 'Could not complete registration.')}`);
         return;
       }
 
-      // Save pending registration in memory
-      pendingStudentData = {
-        name,
-        roll_no: roll,
-        email,
-        dept,
-        password,
-        session_id: sessionId
-      };
-
-      // Transition to Step 2
       document.getElementById('student-reg-step-1').style.display = 'none';
-      document.getElementById('student-reg-step-2').style.display = 'block';
-
-      // Set masked email
-      const maskedEl = document.getElementById('student-reg-masked-email');
-      if (maskedEl) {
-        maskedEl.textContent = data.masked_email || email;
-      }
-
-      // Success alert
-      showAlert('student-reg-alert-2', `📧 <strong>OTP Dispatched:</strong> A unique 6-digit verification code has been sent to <strong>${escapeHtml(email)}</strong>. Valid for 5 minutes.`, 'success');
-
-      const otpInput = document.getElementById('student-reg-otp');
-      if (otpInput) {
-        otpInput.value = '';
-        otpInput.disabled = false;
-        setTimeout(() => otpInput.focus(), 200);
-      }
-
-      // Start 5-minute (300s) countdown timer
-      startOtpExpirationCountdown(data.expires_in_seconds || 300);
-
-      // Start 60-second Resend Cooldown
-      startResendCooldown(data.cooldown_seconds || 60);
-
-      if (sendBtn) {
-        sendBtn.disabled = false;
-        sendBtn.innerHTML = `<span>Send Verification OTP ✉️</span><span>→</span>`;
-      }
-
+      document.getElementById('student-reg-step-3').style.display = 'block';
+      document.getElementById('success-student-id').textContent = data.student_id;
+      document.getElementById('success-student-name').textContent = data.full_name;
+      document.getElementById('success-student-email').textContent = data.email;
+      document.getElementById('success-student-roll').textContent = data.roll_no;
+      document.getElementById('success-student-dept').textContent = data.dept;
+      document.getElementById('success-student-verified-at').textContent = data.email_verified_at || '-';
+      document.getElementById('success-student-created-at').textContent = data.created_at || '-';
+      document.getElementById('student-registration-form')?.reset();
     } catch (err) {
       showAlert('student-reg-alert-1', `⚠️ Connection error: ${escapeHtml(err.message)}`);
-      if (sendBtn) {
-        sendBtn.disabled = false;
-        sendBtn.innerHTML = `<span>Send Verification OTP ✉️</span><span>→</span>`;
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<span>Create Student Account</span><span>→</span>';
       }
     }
   };
 
-  function startOtpExpirationCountdown(seconds) {
-    if (studentOtpTimer) clearInterval(studentOtpTimer);
-    let remaining = seconds;
-    const timerEl = document.getElementById('student-reg-timer');
+  // Keep the legacy function name from older cached frontends from reaching the OTP flow.
+  window.handleStudentSendOtp = window.handleStudentRegistration;
 
-    function update() {
-      const m = Math.floor(remaining / 60);
-      const s = remaining % 60;
-      if (timerEl) {
-        timerEl.textContent = `⏱️ Expires in: ${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
-      }
-      if (remaining <= 0) {
-        clearInterval(studentOtpTimer);
-        if (timerEl) timerEl.textContent = '⚠️ OTP Expired';
-        showAlert('student-reg-alert-2', '⚠️ This verification OTP has expired. Please click "Resend OTP" to receive a fresh code.', 'error');
-        const otpInput = document.getElementById('student-reg-otp');
-        if (otpInput) otpInput.disabled = true;
-      }
-      remaining--;
-    }
-
-    update();
-    studentOtpTimer = setInterval(update, 1000);
-  }
-
-  function startResendCooldown(seconds) {
-    if (studentCooldownTimer) clearInterval(studentCooldownTimer);
-    let cooldown = seconds;
-    const resendBtn = document.getElementById('btn-student-reg-resend');
-
-    if (resendBtn) {
-      resendBtn.disabled = true;
-      resendBtn.textContent = `Resend in ${cooldown}s ⏳`;
-    }
-
-    studentCooldownTimer = setInterval(() => {
-      cooldown--;
-      if (cooldown <= 0) {
-        clearInterval(studentCooldownTimer);
-        if (resendBtn) {
-          resendBtn.disabled = false;
-          resendBtn.textContent = 'Resend OTP ✉️';
-        }
-      } else {
-        if (resendBtn) {
-          resendBtn.textContent = `Resend in ${cooldown}s ⏳`;
-        }
-      }
-    }, 1000);
-  }
-
-  // Resend OTP
-  window.handleStudentRegResendOtp = async function() {
-    if (!pendingStudentData) {
-      window.backToStudentRegForm();
-      return;
-    }
-
-    const resendBtn = document.getElementById('btn-student-reg-resend');
-    if (resendBtn && resendBtn.disabled) return;
-
-    if (resendBtn) {
-      resendBtn.disabled = true;
-      resendBtn.textContent = 'Sending... ⏳';
-    }
-
-    try {
-      const res = await apiFetch('/api/student/register/send-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: pendingStudentData.name,
-          roll_no: pendingStudentData.roll_no,
-          email: pendingStudentData.email,
-          dept: pendingStudentData.dept,
-          password: pendingStudentData.password,
-          confirm_password: pendingStudentData.password,
-          session_id: pendingStudentData.session_id
-        })
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        showAlert('student-reg-alert-2', `⚠️ ${escapeHtml(data.detail || 'Failed to resend OTP.')}`, 'error');
-        if (resendBtn) resendBtn.disabled = false;
-        return;
-      }
-
-      showAlert('student-reg-alert-2', `✅ A new verification code has been dispatched to <strong>${escapeHtml(pendingStudentData.email)}</strong>!`, 'success');
-      const otpInput = document.getElementById('student-reg-otp');
-      if (otpInput) {
-        otpInput.disabled = false;
-        otpInput.value = '';
-        otpInput.focus();
-      }
-
-      startOtpExpirationCountdown(data.expires_in_seconds || 300);
-      startResendCooldown(data.cooldown_seconds || 60);
-
-    } catch (err) {
-      showAlert('student-reg-alert-2', `⚠️ Error resending OTP: ${escapeHtml(err.message)}`, 'error');
-      if (resendBtn) resendBtn.disabled = false;
-    }
-  };
-
-  // Step 2 & 3: Verify OTP and Complete Registration
-  window.handleStudentRegVerifyAndComplete = async function() {
-    if (!pendingStudentData) {
-      window.backToStudentRegForm();
-      return;
-    }
-
-    const otpInput = document.getElementById('student-reg-otp');
-    const otp = (otpInput?.value || '').trim();
-    const verifyBtn = document.getElementById('btn-student-reg-verify');
-
-    hideAlert('student-reg-alert-2');
-
-    if (!otp || otp.length !== 6) {
-      showAlert('student-reg-alert-2', '⚠️ Please enter the complete 6-digit verification code.');
-      if (otpInput) otpInput.focus();
-      return;
-    }
-
-    if (verifyBtn) {
-      verifyBtn.disabled = true;
-      verifyBtn.innerHTML = `<span>Verifying OTP with Backend... ⏳</span>`;
-    }
-
-    try {
-      // 1. Verify OTP with backend
-      const verifyRes = await apiFetch('/api/student/register/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: pendingStudentData.email,
-          otp: otp,
-          session_id: pendingStudentData.session_id
-        })
-      });
-
-      const verifyData = await verifyRes.json();
-
-      if (!verifyRes.ok) {
-        showAlert('student-reg-alert-2', `⚠️ ${escapeHtml(verifyData.detail || 'Invalid verification code.')}`, 'error');
-        if (verifyBtn) {
-          verifyBtn.disabled = false;
-          verifyBtn.innerHTML = `<span>Verify OTP & Complete Registration ✓</span>`;
-        }
-        if (verifyData.detail && (verifyData.detail.includes('locked') || verifyData.detail.includes('invalidated') || verifyData.detail.includes('expired'))) {
-          if (otpInput) otpInput.disabled = true;
-        }
-        return;
-      }
-
-      // 2. Email is verified! Now submit complete registration with verification token
-      showAlert('student-reg-alert-2', `✅ Gmail successfully verified! Creating student account...`, 'success');
-      if (verifyBtn) {
-        verifyBtn.innerHTML = `<span>Creating Student Account... ⏳</span>`;
-      }
-
-      const completeRes = await apiFetch('/api/student/register/complete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: pendingStudentData.name,
-          email: pendingStudentData.email,
-          roll_no: pendingStudentData.roll_no,
-          dept: pendingStudentData.dept,
-          password: pendingStudentData.password,
-          verification_token: verifyData.verification_token,
-          session_id: pendingStudentData.session_id
-        })
-      });
-
-      const completeData = await completeRes.json();
-
-      if (!completeRes.ok) {
-        showAlert('student-reg-alert-2', `⚠️ Registration Error: ${escapeHtml(completeData.detail || 'Could not complete registration.')}`, 'error');
-        if (verifyBtn) {
-          verifyBtn.disabled = false;
-          verifyBtn.innerHTML = `<span>Verify OTP & Complete Registration ✓</span>`;
-        }
-        return;
-      }
-
-      // Stop timers
-      if (studentOtpTimer) clearInterval(studentOtpTimer);
-      if (studentCooldownTimer) clearInterval(studentCooldownTimer);
-
-      // Transition to Step 3 (Success)
-      document.getElementById('student-reg-step-2').style.display = 'none';
-      document.getElementById('student-reg-step-3').style.display = 'block';
-
-      // Fill in details
-      document.getElementById('success-student-id').textContent = completeData.student_id;
-      document.getElementById('success-student-name').textContent = completeData.full_name;
-      document.getElementById('success-student-email').textContent = completeData.email;
-      document.getElementById('success-student-roll').textContent = completeData.roll_no;
-      document.getElementById('success-student-dept').textContent = completeData.dept;
-      document.getElementById('success-student-verified-at').textContent = completeData.email_verified_at || '-';
-      document.getElementById('success-student-created-at').textContent = completeData.created_at || '-';
-
-      // Clear memory
-      pendingStudentData = null;
-      document.getElementById('student-registration-form')?.reset();
-
-      if (typeof showToast === 'function') {
-        showToast(`🎓 Registration Complete! Welcome, ${completeData.full_name}!`, 'green');
-      }
-
-    } catch (err) {
-      showAlert('student-reg-alert-2', `⚠️ Server error: ${escapeHtml(err.message)}`, 'error');
-      if (verifyBtn) {
-        verifyBtn.disabled = false;
-        verifyBtn.innerHTML = `<span>Verify OTP & Complete Registration ✓</span>`;
-      }
-    }
-  };
-
-  // Admin Registered Students Loader
+  
+// Admin Registered Students Loader
   window.loadAdminStudents = async function() {
     const tbody = document.getElementById('admin-students-tbody');
     if (!tbody) return;

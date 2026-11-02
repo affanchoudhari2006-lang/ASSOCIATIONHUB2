@@ -65,16 +65,13 @@ class SecurityRemediationTests(unittest.TestCase):
                     token,
                 ))
 
-    def registration_request(self, *, email="student@example.edu", roll="T-101",
-                             session_id="a" * 32, token="REGISTRATION-token"):
+    def registration_request(self, *, email="student@example.edu", roll="T-101"):
         return server.StudentCompleteRegistrationRequest(
             name="Synthetic Student",
             email=email,
             roll_no=roll,
             dept="Computer Science",
             password="secure-test-password",
-            verification_token=token,
-            session_id=session_id,
         )
 
     def test_membership_list_requires_admin_and_token_can_authorize(self):
@@ -207,40 +204,47 @@ class SecurityRemediationTests(unittest.TestCase):
             trusted_request.scope["client"] = ("198.51.100.10", 12345)
             self.assertEqual(server.get_client_ip(trusted_request), "203.0.113.20")
 
-    def test_registration_token_rejects_expiry_roll_mismatch_and_wrong_session(self):
+    def test_direct_registration_accepts_valid_student_details(self):
         request = make_request("/api/student/register/complete")
-        self.seed_registration_verification(expires_at=time.time() - 1)
-        with self.assertRaises(HTTPException) as expired:
-            asyncio.run(server.student_register_complete(self.registration_request(), request))
-        self.assertEqual(expired.exception.status_code, 403)
+        with patch.dict(os.environ, {"PUBLIC_APP_URL": "https://associationhub.example"}):
+            result = asyncio.run(server.student_register_complete(self.registration_request(), request))
+        self.assertTrue(result["success"])
+        self.assertFalse(result["is_email_verified"])
+        self.assertEqual(result["email_verified_at"], "")
 
-        with closing(sqlite3.connect(server.DB_PATH)) as conn:
-            with conn:
-                conn.execute("DELETE FROM email_otp_verifications")
-        self.seed_registration_verification(roll="T-999")
-        with self.assertRaises(HTTPException) as wrong_roll:
-            asyncio.run(server.student_register_complete(self.registration_request(), request))
-        self.assertEqual(wrong_roll.exception.status_code, 403)
-
-        with closing(sqlite3.connect(server.DB_PATH)) as conn:
-            with conn:
-                conn.execute("DELETE FROM email_otp_verifications")
-        self.seed_registration_verification()
-        with self.assertRaises(HTTPException) as wrong_session:
-            asyncio.run(server.student_register_complete(
-                self.registration_request(session_id="b" * 32), request
-            ))
-        self.assertEqual(wrong_session.exception.status_code, 403)
-
-    def test_registration_verification_token_is_consumed_once(self):
-        self.seed_registration_verification()
+    def test_direct_registration_rejects_duplicate_email_or_roll(self):
         request = make_request("/api/student/register/complete")
         with patch.dict(os.environ, {"PUBLIC_APP_URL": "https://associationhub.example"}):
             result = asyncio.run(server.student_register_complete(self.registration_request(), request))
             self.assertTrue(result["success"])
             with self.assertRaises(HTTPException) as reused:
                 asyncio.run(server.student_register_complete(self.registration_request(), request))
-        self.assertEqual(reused.exception.status_code, 403)
+        self.assertEqual(reused.exception.status_code, 400)
+
+    def test_chat_registration_works_without_otp(self):
+        data = server.ChatRegisterRequest(
+            name="Direct Chat Student",
+            roll_no="CHAT-DIRECT-1",
+            dept="Computer Science & Engineering",
+            email="direct-chat@example.edu",
+        )
+        request = make_request("/api/chat/auth/verify-and-enter")
+
+        result = asyncio.run(server.verify_and_enter_chat(data, request))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["token"])
+        with closing(sqlite3.connect(server.DB_PATH)) as conn:
+            otp_rows = conn.execute(
+                "SELECT COUNT(*) FROM email_otp_verifications WHERE email = ? AND roll_no = ?",
+                (data.email, data.roll_no),
+            ).fetchone()[0]
+            user = conn.execute(
+                "SELECT name, email FROM community_users WHERE roll_no = ?",
+                (data.roll_no,),
+            ).fetchone()
+        self.assertEqual(otp_rows, 0)
+        self.assertEqual(user, ("Direct Chat Student", data.email))
 
     def test_chat_sessions_expire_and_revoked_sessions_do_not_authenticate(self):
         with closing(sqlite3.connect(server.DB_PATH)) as conn:

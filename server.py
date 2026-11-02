@@ -34,7 +34,7 @@ import logging
 from urllib.parse import urlsplit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Mapping
 from contextlib import asynccontextmanager, contextmanager
 
@@ -1232,7 +1232,10 @@ class StudentVerifyOtpRequest(BaseModel):
     @field_validator("email")
     @classmethod
     def clean_email(cls, v: str) -> str:
-        return v.strip().lower()
+        email = v.strip().lower()
+        if not re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", email):
+            raise ValueError("Invalid email format.")
+        return email
 
     @field_validator("otp")
     @classmethod
@@ -1253,8 +1256,6 @@ class StudentCompleteRegistrationRequest(BaseModel):
     roll_no: str = Field(..., min_length=1, max_length=50)
     dept: str = Field(..., min_length=2, max_length=100)
     password: str = Field(..., min_length=6, max_length=100)
-    verification_token: str = Field(..., min_length=10, max_length=120)
-    session_id: str = Field(..., min_length=32, max_length=64)
 
     @field_validator("email")
     @classmethod
@@ -1265,14 +1266,6 @@ class StudentCompleteRegistrationRequest(BaseModel):
     @classmethod
     def sanitize(cls, v: str) -> str:
         return html.escape(re.sub(r'<[^>]*?>', '', v).strip())
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, v: str) -> str:
-        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
-            raise ValueError("Invalid verification session")
-        return v.lower()
-
 
 class SendOtpRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=120)
@@ -1403,8 +1396,6 @@ class ChatRegisterRequest(BaseModel):
     roll_no: str = Field(..., min_length=1, max_length=50)
     dept: str = Field(..., min_length=2, max_length=100)
     email: str = Field(..., min_length=5, max_length=120)
-    otp: str = Field(..., min_length=4, max_length=10)
-    session_id: str = Field(..., min_length=32, max_length=64)
 
     @field_validator("email")
     @classmethod
@@ -1414,17 +1405,10 @@ class ChatRegisterRequest(BaseModel):
             raise ValueError("Invalid email format. Please provide a valid student Gmail address.")
         return v
 
-    @field_validator("name", "roll_no", "dept", "otp")
+    @field_validator("name", "roll_no", "dept")
     @classmethod
     def sanitize(cls, v: str) -> str:
         return html.escape(re.sub(r'<[^>]*?>', '', v).strip())
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, v: str) -> str:
-        if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
-            raise ValueError("Invalid verification session")
-        return v.lower()
 
 class ChatUserStatusUpdate(BaseModel):
     status: str = Field(..., min_length=3, max_length=20)
@@ -1649,232 +1633,14 @@ async def delete_event(event_id: int, request: Request):
         }
 
 
-# ==========================================================================
-# COMPLETE REAL-TIME GMAIL OTP VERIFICATION GATEWAY FOR STUDENT REGISTRATION
-# ==========================================================================
-
-@app.post("/api/student/register/send-otp")
-async def student_register_send_otp(data: StudentSendOtpRequest, request: Request):
-    """
-    Step 1 & 2: Validates registration inputs, checks duplicate accounts,
-    generates secure random 6-digit OTP, stores salted SHA-256 hash in SQLite,
-    and dispatches an actual verification email to that exact student's Gmail inbox.
-
-    Security & Compliance:
-    - Strictly dispatches to data.email (student's own Gmail, never redirected to admin).
-    - 5-minute expiration limit.
-    - 60-second resend cooldown per email.
-    - Per-IP rate limiting to prevent spam.
-    - Prevention of duplicate email or roll number registration.
-    - Salted SHA-256 OTP hashing (plaintext OTP never persisted in database).
-    """
-    ip = get_client_ip(request)
-    check_register_rate_limit(ip)
-
-    name = data.name.strip()
-    email = data.email.strip().lower()
-    roll = data.roll_no.strip().upper()
-    dept = data.dept.strip()
-    now = time.time()
-
-    # Enforce Rejoin Approval Gate: Blocked or removed students require Admin approval
-    check_account_restriction(email, roll, name)
-
-    if data.password != data.confirm_password:
-        raise HTTPException(
-            status_code=400,
-            detail="Password Mismatch: Password and Confirm Password do not match."
-        )
-
-    if len(data.password) < 6:
-        raise HTTPException(
-            status_code=400,
-            detail="Weak Password: Password must be at least 6 characters long."
-        )
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-
-        # 1. Prevent blocked student from requesting OTP or re-registering
-        cursor.execute("SELECT student_id, status FROM registered_students WHERE email = ? OR roll_no = ? LIMIT 1;", (email, roll))
-        existing_stu = cursor.fetchone()
-        if existing_stu:
-            if existing_stu["status"] in ["BLOCKED", "SUSPENDED"]:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"⛔ Access Denied: Your student account has been {existing_stu['status']} by the Administrator."
-                )
-
-        # 1b. Prevent duplicate email in registered_students
-        cursor.execute("SELECT student_id FROM registered_students WHERE email = ? LIMIT 1;", (email,))
-        if cursor.fetchone():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Duplicate Account: The Gmail address '{email}' is already registered with an active student account."
-            )
-
-        # 2. Prevent duplicate roll number in registered_students
-        cursor.execute("SELECT student_id FROM registered_students WHERE roll_no = ? LIMIT 1;", (roll,))
-        if cursor.fetchone():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Duplicate Account: College Roll Number '{roll}' is already registered with an existing student account."
-            )
-
-        # 3. Enforce 60-second resend cooldown
-        cursor.execute("SELECT last_sent_at FROM email_otp_verifications WHERE email = ?;", (email,))
-        existing = cursor.fetchone()
-        if existing and existing["last_sent_at"]:
-            elapsed = now - existing["last_sent_at"]
-            if elapsed < 60:
-                remaining = int(60 - elapsed)
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Resend Cooldown Active: Please wait {remaining} seconds before requesting another OTP."
-                )
-
-        # 4. Generate secure random 6-digit OTP & compute cryptographic salted hash
-        otp_code = f"{secrets.randbelow(900000) + 100000}"
-        otp_hash = hash_otp(otp_code, email)
-        expires_at = now + 300  # Strictly 5 minutes validity
-
-        # 5. Persist hashed OTP, timestamps and reset attempts in email_otp_verifications
-        cursor.execute("""
-        INSERT INTO email_otp_verifications
-            (email, otp_hash, otp_code, roll_no, association, session_id, expires_at, last_sent_at, attempts, is_verified, created_at)
-        VALUES (?, ?, '', ?, NULL, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
-        ON CONFLICT(email) DO UPDATE SET
-            otp_hash = excluded.otp_hash,
-            otp_code = '',
-            roll_no = excluded.roll_no,
-            association = NULL,
-            session_id = excluded.session_id,
-            expires_at = excluded.expires_at,
-            last_sent_at = excluded.last_sent_at,
-            attempts = 0,
-            is_verified = 0,
-            verification_token = NULL;
-        """, (email, otp_hash, roll, data.session_id, expires_at, now))
-        log_audit_event("STUDENT_OTP_REQUESTED", ip, f"Student registration OTP requested for {email} (Roll: {roll})", conn=conn)
-
-    # 6. Dispatch real email to student's exact Gmail via SMTP
-    smtp_res = send_real_smtp_email(email, name, otp_code)
-    if not smtp_res["sent"]:
-        log_audit_event("EMAIL_DISPATCH_FAILED", ip, f"Real Gmail dispatch failed to {email}: {smtp_res.get('reason')}")
-        raise HTTPException(
-            status_code=503,
-            detail="Verification email could not be sent. Please try again later."
-        )
-
-    log_audit_event("STUDENT_REAL_EMAIL_DISPATCHED", ip, f"Dispatched real OTP to student Gmail {email}")
-    return {
-        "success": True,
-        "email": email,
-        "masked_email": mask_email(email),
-        "expires_in_seconds": 300,
-        "cooldown_seconds": 60,
-        "message": f"Verification code successfully dispatched to your Gmail inbox ({email})! Valid for 5 minutes."
-    }
-
-
-@app.post("/api/student/register/verify-otp")
-async def student_register_verify_otp(data: StudentVerifyOtpRequest, request: Request):
-    """
-    Step 3: Verifies 6-digit OTP code against stored cryptographic hash.
-    Enforces 5-minute expiry, max 5 attempts lockout, timing-safe comparison,
-    and issues a secure one-time verification token.
-    Invalidates the OTP immediately upon success to prevent replay attacks.
-    """
-    ip = get_client_ip(request)
-    email = data.email.strip().lower()
-    otp = data.otp.strip()
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-        SELECT otp_hash, expires_at, attempts FROM email_otp_verifications
-        WHERE email = ? AND session_id = ?;
-        """, (email, data.session_id))
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(
-                status_code=400,
-                detail="No verification request found for this email. Please click 'Send OTP' first."
-            )
-
-        # Check 5-minute expiry
-        if time.time() > row["expires_at"]:
-            raise HTTPException(
-                status_code=400,
-                detail="OTP verification code has expired (5-minute validity limit). Please request a new code."
-            )
-
-        # Check max 5 attempts lockout
-        if row["attempts"] >= 5:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many incorrect OTP attempts (maximum 5). For security, this OTP has been locked. Please request a new code."
-            )
-
-        # Timing-attack safe hash comparison
-        candidate_hash = hash_otp(otp, email)
-        if not row["otp_hash"] or not hmac.compare_digest(row["otp_hash"], candidate_hash):
-            new_attempts = row["attempts"] + 1
-            cursor.execute("UPDATE email_otp_verifications SET attempts = ? WHERE email = ? AND session_id = ?;", (new_attempts, email, data.session_id))
-            conn.commit()
-            remaining = 5 - new_attempts
-            if remaining <= 0:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Maximum 5 incorrect attempts reached. This OTP has been invalidated. Please request a new code."
-                )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Incorrect OTP verification code. {remaining} attempt(s) remaining."
-            )
-
-        # Valid OTP: Invalidate OTP (prevent reuse), mark verified, record verification time
-        token = f"STUDENT_VERIFIED_{secrets.token_hex(24)}"
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute("""
-        UPDATE email_otp_verifications
-        SET is_verified = 1,
-            verification_token = ?,
-            verified_at = ?,
-            otp_hash = NULL,
-            attempts = 0
-        WHERE email = ? AND session_id = ? AND otp_hash = ?
-          AND is_verified = 0 AND expires_at > ?;
-        """, (token, now_str, email, data.session_id, row["otp_hash"], time.time()))
-        if cursor.rowcount != 1:
-            raise HTTPException(status_code=400, detail="OTP verification session expired or was already used. Please request a new code.")
-
-        log_audit_event("STUDENT_GMAIL_VERIFIED", ip, f"Verified student Gmail {email} successfully", conn=conn)
-
-        return {
-            "success": True,
-            "verified": True,
-            "email": email,
-            "verification_token": token,
-            "verified_at": now_str,
-            "message": f"Gmail address {email} successfully verified! You may now complete your registration."
-        }
-
-
 @app.post("/api/student/register/complete", status_code=201)
 async def student_register_complete(data: StudentCompleteRegistrationRequest, request: Request):
-    """
-    Step 4: ENFORCES STRICT BACKEND REGISTRATION GATE.
-    A student CANNOT register an account before successfully verifying their Gmail.
-    Even if someone bypasses the frontend or calls this API directly, the backend
-    strictly verifies the cryptographic verification token in SQLite database.
-    """
+    """Register a student directly after basic validation and duplicate checks."""
     ip = get_client_ip(request)
     name = data.name.strip()
     email = data.email.strip().lower()
     roll = data.roll_no.strip().upper()
     dept = data.dept.strip()
-    token = data.verification_token.strip()
 
     if len(data.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
@@ -1882,29 +1648,10 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
     with get_db() as conn:
         cursor = conn.cursor()
 
-        # STRICT BACKEND ENFORCEMENT: Verify that Gmail was verified via OTP
-        now = time.time()
-        cursor.execute("""
-        SELECT is_verified, verified_at FROM email_otp_verifications
-        WHERE email = ? AND roll_no = ? AND session_id = ?
-          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
-        """, (email, roll, data.session_id, token, now))
-        vrow = cursor.fetchone()
-        if not vrow:
-            log_audit_event("REGISTRATION_BLOCKED_UNVERIFIED", ip, f"Blocked unauthorized registration attempt for {email}: Missing/invalid OTP verification token", conn=conn)
-            raise HTTPException(
-                status_code=403,
-                detail="REGISTRATION BLOCKED: Gmail verification required. You cannot register an account without successfully verifying your Gmail with OTP. Direct API bypass rejected."
-            )
-
-        cursor.execute("""
-        UPDATE email_otp_verifications
-        SET verification_token = NULL, is_verified = 0, verified_at = NULL, otp_hash = NULL
-        WHERE email = ? AND roll_no = ? AND session_id = ?
-          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
-        """, (email, roll, data.session_id, token, time.time()))
-        if cursor.rowcount != 1:
-            raise HTTPException(status_code=403, detail="Registration verification expired or has already been used. Please verify again.")
+        cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR roll_no = ? LIMIT 1;", (email, roll))
+        if cursor.fetchone():
+            log_audit_event("REGISTRATION_DUPLICATE_BLOCKED", ip, f"Blocked duplicate registration for {email} ({roll})", conn=conn)
+            raise HTTPException(status_code=400, detail="Duplicate Account: The Gmail address or roll number is already registered.")
 
         # Duplicate check: Email
         cursor.execute("SELECT student_id FROM registered_students WHERE email = ? LIMIT 1;", (email,))
@@ -1928,12 +1675,12 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
         # Generate unique Student ID
         student_id = f"NKOCET-STU-2026-{secrets.token_hex(3).upper()}"
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        verified_at = vrow["verified_at"] or created_at
+        verified_at = ""
 
         # Insert permanent student record
         cursor.execute("""
         INSERT INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?);
         """, (student_id, name, email, roll, dept, pwd_hash, salt, verified_at, created_at))
 
         # Synchronize into memberships table if not present so gate & verify know them
@@ -1945,11 +1692,11 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
             qr_b64 = make_qr_base64(verify_url)
             cursor.execute("""
             INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
-            VALUES (?, ?, ?, ?, ?, 'Second Year (SY)', 'CSESA', 'Verified Registered Student', ?, 'ACTIVE', ?, ?);
+                VALUES (?, ?, ?, ?, ?, 'Second Year (SY)', 'CSESA', 'Registered Student', ?, 'ACTIVE', ?, ?);
             """, (pass_id, name, roll, email, dept, qr_b64, sig, created_at))
 
         session_token = f"STUDENT_SESSION.{secrets.token_hex(20)}"
-        log_audit_event("STUDENT_REGISTERED", ip, f"Registered new verified student {name} ({roll}) with Gmail {email} [ID: {student_id}]", conn=conn)
+        log_audit_event("STUDENT_REGISTERED", ip, f"Registered new student {name} ({roll}) with Gmail {email} [ID: {student_id}]", conn=conn)
 
         return {
             "success": True,
@@ -1958,11 +1705,11 @@ async def student_register_complete(data: StudentCompleteRegistrationRequest, re
             "email": email,
             "roll_no": roll,
             "dept": dept,
-            "is_email_verified": True,
+            "is_email_verified": False,
             "email_verified_at": verified_at,
             "created_at": created_at,
             "session_token": session_token,
-            "message": f"Congratulations {name}! Your student account ({student_id}) has been created with verified Gmail ({email})."
+            "message": f"Congratulations {name}! Your student account ({student_id}) has been created."
         }
 
 
@@ -2139,78 +1886,30 @@ async def verify_email_otp(data: VerifyOtpRequest, request: Request):
 
 @app.post("/api/chat/auth/send-otp")
 async def send_chat_otp(data: SendOtpRequest, request: Request):
-    """Sends OTP to student Gmail for unlocking community chat."""
-    return await send_email_otp(data, request)
+    raise HTTPException(status_code=410, detail="Chat Gmail OTP verification has been removed.")
 
 
 @app.post("/api/chat/auth/verify-and-enter")
 async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
-    """
-    Verifies OTP against cryptographic hash, registers student identity in community_users SQLite table,
-    marks email permanently verified, and returns an authenticated chat session token.
-    """
+    """Registers a chat identity directly without changing email verification state."""
     ip = get_client_ip(request)
     email = data.email.strip().lower()
-    otp = data.otp.strip()
     name = data.name.strip()
     roll = data.roll_no.strip().upper()
     dept = data.dept.strip()
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-        SELECT otp_hash, expires_at, attempts FROM email_otp_verifications
-        WHERE email = ? AND session_id = ? AND roll_no = ? AND association IS NULL;
-        """, (email, data.session_id, roll))
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=400, detail="No verification request found for this email. Please click 'Send OTP' first.")
-
-        if time.time() > row["expires_at"]:
-            raise HTTPException(status_code=400, detail="OTP verification code has expired (5-minute validity limit). Please request a new code.")
-
-        if row["attempts"] >= 5:
-            raise HTTPException(status_code=429, detail="Too many failed attempts (maximum 5). Please request a new code.")
-
-        candidate_hash = hash_otp(otp, email)
-        if not hmac.compare_digest(row["otp_hash"] or "", candidate_hash):
-            new_attempts = row["attempts"] + 1
-            cursor.execute("""
-            UPDATE email_otp_verifications SET attempts = ?
-            WHERE email = ? AND session_id = ? AND roll_no = ? AND association IS NULL;
-            """, (new_attempts, email, data.session_id, roll))
-            conn.commit()
-            remaining = 5 - new_attempts
-            if remaining <= 0:
-                raise HTTPException(status_code=429, detail="Maximum 5 incorrect attempts reached. This OTP has been locked. Please request a new code.")
-            raise HTTPException(status_code=400, detail=f"Incorrect OTP verification code. {remaining} attempt(s) remaining.")
-
         # Check if user already exists and is banned
         cursor.execute("SELECT user_id, status FROM community_users WHERE email = ? OR roll_no = ?;", (email, roll))
         existing_user = cursor.fetchone()
         if existing_user and existing_user["status"] == "BANNED":
             raise HTTPException(status_code=403, detail="⛔ Access Denied: Your chat account has been banned by the Administrator.")
 
-        # Mark email permanently verified in database
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        token = f"VERIFIED_{secrets.token_hex(16)}"
-        cursor.execute("""
-        UPDATE email_otp_verifications
-        SET is_verified = 1,
-            verification_token = ?,
-            verified_at = ?,
-            attempts = 0,
-            otp_hash = NULL
-        WHERE email = ? AND session_id = ? AND roll_no = ?
-          AND association IS NULL AND otp_hash = ?
-          AND is_verified = 0 AND expires_at > ?;
-        """, (token, now_str, email, data.session_id, roll, row["otp_hash"], time.time()))
-        if cursor.rowcount != 1:
-            raise HTTPException(status_code=400, detail="OTP verification session expired or was already used. Please request a new code.")
-
         user_id = existing_user["user_id"] if existing_user else f"CHAT-USER-{secrets.token_hex(4).upper()}"
         session_token = f"CHAT_SESSION.{secrets.token_hex(16)}"
-        session_expires_at = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        session_expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
 
         cursor.execute("""
         INSERT INTO community_users
@@ -2238,37 +1937,11 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
             VALUES (?, ?, ?, ?, ?, 'Second Year (SY)', 'CSESA', 'Campus Pulse Community Peer', ?, 'ACTIVE', ?, ?);
             """, (pass_id, name, roll, email, dept, qr_b64, sig, now_str))
 
-        log_audit_event("CHAT_GATEWAY_AUTHENTICATED", ip, f"Student {name} ({roll}) entered community chat via Gmail {email}", conn=conn)
+        log_audit_event("CHAT_GATEWAY_AUTHENTICATED", ip, f"Student {name} ({roll}) entered community chat via {email}", conn=conn)
 
         return {
             "success": True,
-            "message": f"Welcome to Campus Pulse, {name}! Gmail identity verified.",
-            "token": session_token,
-            "user": {
-                "user_id": user_id,
-                "name": name,
-                "roll_no": roll,
-                "email": email,
-                "dept": dept,
-                "status": "ACTIVE"
-            }
-        }
-        cursor.execute("SELECT pass_id FROM memberships WHERE roll_no = ?;", (roll,))
-        if not cursor.fetchone():
-            pass_id = f"NKOCET-2026-CSESA-{secrets.token_hex(3).upper()}"
-            sig = compute_hmac_signature(pass_id, roll, "CSESA")
-            qr_url = build_verification_url(pass_id, sig)
-            qr_b64 = make_qr_base64(qr_url)
-            cursor.execute("""
-            INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
-            VALUES (?, ?, ?, ?, ?, 'Second Year (SY)', 'CSESA', 'Campus Pulse Community Peer', ?, 'ACTIVE', ?, ?);
-            """, (pass_id, name, roll, email, dept, qr_b64, sig, now_str))
-
-        log_audit_event("CHAT_GATEWAY_AUTHENTICATED", ip, f"Student {name} ({roll}) entered community chat via Gmail {email}", conn=conn)
-
-        return {
-            "success": True,
-            "message": f"Welcome to Campus Pulse, {name}! Identity verified.",
+            "message": f"Welcome to Campus Pulse, {name}!",
             "token": session_token,
             "user": {
                 "user_id": user_id,
@@ -2300,7 +1973,7 @@ async def get_chat_current_user(request: Request):
         """, (token.strip(),))
         user = cursor.fetchone()
         if not user:
-            raise HTTPException(status_code=401, detail="Session expired or invalid. Please verify with Gmail again.")
+            raise HTTPException(status_code=401, detail="Chat session expired or invalid. Please enter the chat again.")
 
         return {
             "authenticated": True,
@@ -2854,7 +2527,7 @@ async def create_community_post(data: CommunityPostCreate, request: Request):
             if not c_verified:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Security Gate: Roll No '{roll}' was not found in the verified student registry. Please complete Gmail OTP verification to join the chat."
+                    detail=f"Security Gate: Roll No '{roll}' was not found in the student registry."
                 )
             verified = {"name": c_verified["name"], "roll_no": c_verified["roll_no"], "dept": c_verified["dept"], "year": "Second Year (SY)"}
 
@@ -2949,7 +2622,1746 @@ async def create_post_comment(post_id: str, data: CommunityCommentCreate, reques
             if not c_verified:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Security Gate: Roll No '{roll}' is not registered. Please complete Gmail OTP verification to join the chat."
+                    detail=f"Security Gate: Roll No '{roll}' is not registered."
+                )
+            verified = {"name": c_verified["name"], "roll_no": c_verified["roll_no"]}
+
+        cursor.execute("SELECT post_id FROM community_posts WHERE post_id = ?;", (post_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Thread not found.")
+
+        comment_id = f"COMM-{secrets.token_hex(3).upper()}"
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute("""
+        INSERT INTO community_comments (comment_id, post_id, author_name, roll_no, content, created_at)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """, (comment_id, post_id, verified["name"], roll, data.content, created_at))
+
+        return {
+            "success": True,
+            "comment_id": comment_id,
+            "author_name": verified["name"],
+            "created_at": created_at
+        }
+
+
+# --------------------------------------------------------------------------
+# CAMPUS ANNOUNCEMENT BROADCASTER
+# --------------------------------------------------------------------------
+
+@app.get("/api/announcements/current")
+async def get_current_announcement():
+    """Fetches the active campus ribbon announcement."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT tag, message, button_text, updated_at FROM announcements WHERE is_active = 1 ORDER BY id DESC LIMIT 1;")
+        row = cursor.fetchone()
+        if not row:
+            return {
+                "tag": "📢 Campus Notice",
+                "message": "Academic Session 2026 Student Association Membership & Council Registrations Open.",
+                "button_text": "Apply Now →"
+            }
+        return dict(row)
+
+
+@app.post("/api/admin/announcements")
+async def update_announcement(data: AnnouncementUpdate, request: Request):
+    """Admin endpoint: Broadcasts a new top announcement across the entire portal."""
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+        INSERT INTO announcements (tag, message, button_text, is_active, updated_at)
+        VALUES (?, ?, ?, 1, ?);
+        """, (data.tag.strip(), data.message.strip(), data.button_text.strip(), updated_at))
+        
+        log_audit_event("ANNOUNCEMENT_PUBLISHED", ip, f"Published broadcast: [{data.tag.strip()}] {data.message.strip()[:60]}...")
+        return {
+            "success": True,
+            "message": "Live announcement broadcast successfully updated across portal.",
+            "announcement": {
+                "tag": data.tag.strip(),
+                "message": data.message.strip(),
+                "button_text": data.button_text.strip(),
+                "updated_at": updated_at
+            }
+        }
+
+
+# --------------------------------------------------------------------------
+# MASTER ADMIN CONTROL SUITE
+# --------------------------------------------------------------------------
+
+@app.post("/api/admin/verify-pin")
+async def verify_admin_pin(data: AdminPinVerify, request: Request):
+    """Validates Admin Master PIN with brute-force defense and returns signed session token."""
+    ip = get_client_ip(request)
+    check_admin_brute_force(ip)
+
+    submitted_pin = data.pin.strip()
+    if hmac.compare_digest(submitted_pin.encode("utf-8"), ADMIN_SECRET_PIN.encode("utf-8")):
+        _admin_failed_attempts.pop(ip, None)
+        with get_db() as conn:
+            conn.execute("DELETE FROM admin_failed_attempts WHERE ip_address = ?;", (ip,))
+        token = create_admin_session_token()
+        log_audit_event("ADMIN_LOGIN_SUCCESS", ip, "Coordinator Console clearance unlocked.")
+        return {
+            "valid": True,
+            "token": token,
+            "expires_in_hours": 3,
+            "message": "Master Administrator clearance verified."
+        }
+    
+    record_admin_failed_attempt(ip)
+    log_audit_event("ADMIN_LOGIN_FAILED", ip, "Invalid PIN entered.")
+    raise HTTPException(status_code=403, detail="Invalid Administrator Security PIN.")
+
+
+@app.post("/api/admin/logout")
+async def logout_admin(request: Request):
+    """Revokes the current administrator session token."""
+    verify_admin_access(request)
+    key = (
+        request.headers.get("X-Admin-Token")
+        or request.headers.get("X-Admin-Key")
+        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    )
+    if key.startswith("SESSION."):
+        parts = key.split(".")
+        if len(parts) >= 3:
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE admin_sessions SET revoked_at = ? WHERE session_id = ?;",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), parts[2]),
+                )
+    return {"success": True, "message": "Administrator session revoked."}
+
+
+@app.patch("/api/admin/members/{pass_id}/status")
+async def update_member_status(pass_id: str, data: StatusUpdate, request: Request):
+    """Admin endpoint: Toggles student status between ACTIVE and SUSPENDED."""
+    verify_admin_access(request)
+    clean_id = pass_id.strip()
+    ip = get_client_ip(request)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT pass_id, name, roll_no, email FROM memberships WHERE pass_id = ?;", (clean_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Member pass not found.")
+
+        cursor.execute("UPDATE memberships SET status = ? WHERE pass_id = ?;", (data.status, clean_id))
+        
+        if data.status in ["SUSPENDED", "BLOCKED", "RESTRICTED"]:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("""
+            INSERT INTO account_restrictions (email, roll_no, name, reason, status, restricted_at)
+            VALUES (?, ?, ?, 'Member Pass Suspended by Administrator', 'RESTRICTED', ?);
+            """, (row["email"] or "", row["roll_no"], row["name"], now_str))
+        log_audit_event("MEMBER_STATUS_CHANGED", ip, f"Updated pass {clean_id} ({row['name']}) status to {data.status}", conn=conn)
+        return {
+            "success": True,
+            "pass_id": clean_id,
+            "status": data.status,
+            "message": f"Status for {row['name']} updated to {data.status}."
+        }
+
+
+@app.get("/api/admin/students")
+async def list_admin_registered_students(request: Request):
+    """
+    Administrator endpoint: Lists all registered students with verified email timestamps.
+    Access strictly gated to Master Admin Authority. Confidential Gmail visible only to admin.
+    """
+    verify_admin_access(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT student_id, full_name, email, roll_no, dept, is_email_verified, email_verified_at, status, created_at
+        FROM registered_students
+        ORDER BY created_at DESC;
+        """)
+        rows = cursor.fetchall()
+        return {"students": [dict(r) for r in rows], "count": len(rows)}
+
+
+@app.patch("/api/admin/students/{student_id}/status")
+async def update_student_account_status(student_id: str, data: StatusUpdate, request: Request):
+    """
+    Administrator endpoint: Toggles student account status between ACTIVE, BLOCKED, and SUSPENDED.
+    Access strictly gated to Master Admin Authority.
+    """
+    verify_admin_access(request)
+    clean_id = student_id.strip()
+    ip = get_client_ip(request)
+    new_status = data.status.strip().upper()
+
+    if new_status not in {"ACTIVE", "BLOCKED", "SUSPENDED"}:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be ACTIVE, BLOCKED, or SUSPENDED.")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT student_id, full_name, email, roll_no FROM registered_students WHERE student_id = ?;", (clean_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Student record not found.")
+
+        cursor.execute("UPDATE registered_students SET status = ? WHERE student_id = ?;", (new_status, clean_id))
+        
+        # Also sync to community_users and memberships
+        community_status = "BANNED" if new_status == "BLOCKED" else new_status
+        if community_status == "ACTIVE":
+            cursor.execute(
+                "UPDATE community_users SET status = ? WHERE email = ? OR roll_no = ?;",
+                (community_status, row["email"], row["roll_no"]),
+            )
+        else:
+            cursor.execute("""
+            UPDATE community_users
+            SET status = ?, session_token = NULL, session_revoked_at = CURRENT_TIMESTAMP
+            WHERE email = ? OR roll_no = ?;
+            """, (community_status, row["email"], row["roll_no"]))
+        cursor.execute("UPDATE memberships SET status = ? WHERE roll_no = ?;", (new_status, row["roll_no"]))
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if new_status in ["BLOCKED", "SUSPENDED"]:
+            cursor.execute("""
+            INSERT INTO account_restrictions (email, roll_no, name, reason, status, restricted_at)
+            VALUES (?, ?, ?, 'Student Account Blocked by Administrator', 'RESTRICTED', ?);
+            """, (row["email"], row["roll_no"], row["full_name"], now_str))
+
+        log_audit_event("STUDENT_STATUS_CHANGED", ip, f"Admin updated student {clean_id} ({row['full_name']}) status to {new_status}", conn=conn)
+
+        return {
+            "success": True,
+            "student_id": clean_id,
+            "status": new_status,
+            "message": f"Student {row['full_name']} ({row['roll_no']}) status updated to {new_status}."
+        }
+
+
+@app.delete("/api/admin/students/{student_id}")
+async def delete_student_account(student_id: str, request: Request):
+    """
+    Administrator endpoint: Permanently removes a student account and resets verification.
+    Access strictly gated to Master Admin Authority.
+    """
+    verify_admin_access(request)
+    clean_id = student_id.strip()
+    ip = get_client_ip(request)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT student_id, full_name, email, roll_no FROM registered_students WHERE student_id = ?;", (clean_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Student record not found.")
+
+        email = row["email"]
+        name = row["full_name"]
+        roll = row["roll_no"]
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Record in account_restrictions: require admin approval to ever rejoin
+        cursor.execute("""
+        INSERT INTO account_restrictions (email, roll_no, name, reason, status, restricted_at)
+        VALUES (?, ?, ?, 'Student Account Purged/Deleted by Administrator', 'RESTRICTED', ?);
+        """, (email, roll, name, now_str))
+
+        cursor.execute("DELETE FROM registered_students WHERE student_id = ?;", (clean_id,))
+        cursor.execute("DELETE FROM email_otp_verifications WHERE email = ?;", (email,))
+        cursor.execute("DELETE FROM community_users WHERE email = ? OR roll_no = ?;", (email, roll))
+        
+        log_audit_event("STUDENT_ACCOUNT_DELETED", ip, f"Admin permanently deleted student {name} ({clean_id}, Roll: {roll}, Email: {email})", conn=conn)
+
+        return {
+            "success": True,
+            "message": f"Student account {clean_id} ({name}) permanently deleted from AssociationHub."
+        }
+
+
+@app.get("/api/admin/export/students.csv")
+async def export_registered_students_csv(request: Request):
+    """
+    Administrator endpoint: Exports official verified student registry with confidential Gmail addresses.
+    Access strictly gated to Master Admin Authority.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT student_id, full_name, roll_no, dept, email, is_email_verified, email_verified_at, status, created_at
+        FROM registered_students
+        ORDER BY created_at DESC;
+        """)
+        rows = cursor.fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Student ID", "Full Name", "Roll / PRN", "Department",
+        "Official Student Gmail (Confidential)", "Email Verified",
+        "Verification Timestamp", "Account Status", "Registered At"
+    ])
+
+    for r in rows:
+        writer.writerow([
+            r["student_id"],
+            r["full_name"],
+            r["roll_no"],
+            r["dept"],
+            r["email"],
+            "VERIFIED" if r["is_email_verified"] else "UNVERIFIED",
+            r["email_verified_at"] or "",
+            r["status"] or "ACTIVE",
+            r["created_at"]
+        ])
+
+    log_audit_event("EXPORT_STUDENTS_CSV", ip, "Admin exported verified student directory CSV")
+    output.seek(0)
+    filename = f"NKOCET_Verified_Students_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+# --------------------------------------------------------------------------
+# ADMINISTRATOR REJOIN APPROVAL GATEWAY
+# --------------------------------------------------------------------------
+
+@app.get("/api/admin/rejoin-requests")
+async def list_admin_rejoin_requests(request: Request):
+    """
+    Administrator endpoint: Lists all students whose accounts were blocked or removed
+    and requires explicit Administrator authorization to rejoin.
+    """
+    verify_admin_access(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT id, email, roll_no, name, reason, status, restricted_at, rejoin_requested_at, rejoin_approved_at, reviewed_by
+        FROM account_restrictions
+        ORDER BY 
+            CASE status 
+                WHEN 'REJOIN_PENDING' THEN 1 
+                WHEN 'RESTRICTED' THEN 2 
+                ELSE 3 
+            END ASC,
+            id DESC;
+        """)
+        rows = cursor.fetchall()
+        pending_count = sum(1 for r in rows if r["status"] == "REJOIN_PENDING")
+        return {"requests": [dict(r) for r in rows], "count": len(rows), "pending_count": pending_count}
+
+
+@app.post("/api/admin/rejoin-requests/{request_id}/approve")
+async def approve_student_rejoin(request_id: int, request: Request):
+    """
+    Administrator endpoint: Approves a previously banned or removed student to rejoin
+    and register their membership pass or student account.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, email, roll_no, name FROM account_restrictions WHERE id = ?;", (request_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Rejoin request not found.")
+
+        # Set status to REJOIN_APPROVED
+        cursor.execute("""
+        UPDATE account_restrictions
+        SET status = 'REJOIN_APPROVED',
+            rejoin_approved_at = ?,
+            reviewed_by = 'Administrator'
+        WHERE id = ?;
+        """, (now_str, request_id))
+
+        # Also unblock in registered_students if present
+        cursor.execute("UPDATE registered_students SET status = 'ACTIVE' WHERE email = ? OR (roll_no != '' AND roll_no = ?);", 
+                       (row["email"], row["roll_no"] or ""))
+        # Also unblock in memberships if present
+        cursor.execute("UPDATE memberships SET status = 'ACTIVE' WHERE email = ? OR (roll_no != '' AND roll_no = ?);", 
+                       (row["email"], row["roll_no"] or ""))
+
+        log_audit_event("REJOIN_REQUEST_APPROVED", ip, f"Admin approved rejoining for {row['name']} ({row['email']}, Roll: {row['roll_no']})", conn=conn)
+
+        return {
+            "success": True,
+            "message": f"Rejoining successfully APPROVED for {row['name']} ({row['email']}). They may now register or join."
+        }
+
+
+@app.post("/api/admin/rejoin-requests/{request_id}/reject")
+async def reject_student_rejoin(request_id: int, request: Request):
+    """
+    Administrator endpoint: Rejects a student rejoin request and keeps their account permanently restricted.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, email, roll_no, name FROM account_restrictions WHERE id = ?;", (request_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Rejoin request not found.")
+
+        cursor.execute("""
+        UPDATE account_restrictions
+        SET status = 'RESTRICTED',
+            reviewed_by = 'Administrator'
+        WHERE id = ?;
+        """, (request_id,))
+
+        log_audit_event("REJOIN_REQUEST_REJECTED", ip, f"Admin rejected rejoining for {row['name']} ({row['email']})", conn=conn)
+
+        return {
+            "success": True,
+            "message": f"Rejoining request REJECTED for {row['name']}. Account remains restricted."
+        }
+
+
+@app.get("/api/admin/members")
+async def get_admin_members(request: Request, association: Optional[str] = None):
+    """
+    Administrator endpoint: Returns full member directory INCLUDING confidential verified Gmail.
+    Access strictly gated to Master Admin Authority.
+    """
+    verify_admin_access(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if association and association != "ALL":
+            cursor.execute("""
+            SELECT pass_id, name, roll_no, email, dept, year, association, interest, status, crypto_signature, created_at
+            FROM memberships WHERE association = ? ORDER BY created_at DESC;
+            """, (association.strip().upper(),))
+        else:
+            cursor.execute("""
+            SELECT pass_id, name, roll_no, email, dept, year, association, interest, status, crypto_signature, created_at
+            FROM memberships ORDER BY created_at DESC;
+            """)
+        rows = cursor.fetchall()
+        return {"count": len(rows), "members": [dict(r) for r in rows]}
+
+
+@app.get("/api/admin/export/members.csv")
+async def export_members_csv(request: Request):
+    """
+    Admin endpoint: Streams RFC-4180 CSV with UTF-8 BOM of all registered members
+    formatted for HOD and NAAC compliance including confidential verified Gmail.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT pass_id, name, roll_no, email, dept, year, association, status, crypto_signature, created_at, interest
+        FROM memberships ORDER BY association ASC, roll_no ASC;
+        """)
+        rows = cursor.fetchall()
+
+        output = io.StringIO()
+        # UTF-8 BOM for Microsoft Excel compatibility
+        output.write('\ufeff')
+        writer = csv.writer(output)
+        writer.writerow([
+            "Pass ID",
+            "Student Full Name",
+            "Roll No / PRN",
+            "Verified Gmail (Confidential)",
+            "Branch / Department",
+            "Academic Year",
+            "Student Association",
+            "Membership Status",
+            "HMAC Crypto Signature",
+            "Registration Timestamp",
+            "Technical Interests & Skills"
+        ])
+
+        for r in rows:
+            writer.writerow([
+                r["pass_id"],
+                r["name"],
+                r["roll_no"],
+                r["email"] if "email" in r.keys() and r["email"] else "Not Recorded",
+                r["dept"],
+                r["year"],
+                r["association"],
+                r["status"] if "status" in r.keys() and r["status"] else "ACTIVE",
+                r["crypto_signature"] if "crypto_signature" in r.keys() else "VERIFIED",
+                r["created_at"],
+                r["interest"]
+            ])
+
+        csv_content = output.getvalue()
+        output.close()
+
+        log_audit_event("CSV_EXPORT_DOWNLOADED", ip, f"Exported {len(rows)} member records to CSV for HOD compliance.", conn=conn)
+        filename = f"NKOCET_Association_Members_{datetime.now().strftime('%Y%m%d')}.csv"
+        return Response(
+            content=csv_content.encode("utf-8"),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+
+
+@app.delete("/api/community/posts/{post_id}")
+async def admin_delete_post(post_id: str, request: Request):
+    """Admin endpoint: Moderates and deletes inappropriate community posts."""
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT post_id, title FROM community_posts WHERE post_id = ?;", (post_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Post not found.")
+
+        cursor.execute("DELETE FROM community_comments WHERE post_id = ?;", (post_id,))
+        cursor.execute("DELETE FROM community_posts WHERE post_id = ?;", (post_id,))
+        log_audit_event("COMMUNITY_POST_PURGED", ip, f"Purged discussion thread {post_id}: '{row['title']}'", conn=conn)
+        return {
+            "success": True,
+            "message": f"Discussion post '{row['title']}' was removed by Administrator."
+        }
+
+
+@app.get("/api/admin/community/unmask/{post_id}")
+async def admin_unmask_post(post_id: str, request: Request):
+    """
+    Admin Authority: Reveals true student identity (Roll No, Name & Verified Gmail) for anonymous posts
+    in case of severe code of conduct violations.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT p.post_id, p.author_name, p.roll_no, p.dept, p.year, p.title, p.created_at,
+               COALESCE(u.name, m.name) AS registered_name,
+               COALESCE(u.email, m.email) AS verified_email
+        FROM community_posts p
+        LEFT JOIN memberships m ON p.roll_no = m.roll_no
+        LEFT JOIN community_users u ON p.roll_no = u.roll_no
+        WHERE p.post_id = ?;
+        """, (post_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Post not found.")
+
+        true_name = row["registered_name"] or row["author_name"]
+        verified_email = row["verified_email"] or "Not recorded"
+        log_audit_event("ANONYMOUS_AUTHOR_UNMASKED", ip, f"Unmasked anonymous author of {post_id} -> {true_name} ({row['roll_no']}) [{verified_email}]", conn=conn)
+
+        return {
+            "post_id": row["post_id"],
+            "title": row["title"],
+            "true_student_name": true_name,
+            "true_roll_no": row["roll_no"],
+            "verified_gmail": verified_email,
+            "department": row["dept"],
+            "year": row["year"],
+            "timestamp": row["created_at"],
+            "message": "Confidential identity unmasked for Administrative Moderation."
+        }
+
+
+# --------------------------------------------------------------------------
+# MASTER ADMIN: CHAT USER MANAGEMENT & AUTHORITIES
+# --------------------------------------------------------------------------
+
+@app.get("/api/admin/chat/users")
+async def get_admin_chat_users(request: Request):
+    """
+    Administrator endpoint: Returns all verified community chat users with confidential Gmails,
+    Roll numbers, departments, and active/mute/ban status.
+    """
+    verify_admin_access(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT user_id, name, roll_no, email, dept, status, created_at, last_active
+        FROM community_users ORDER BY last_active DESC;
+        """)
+        rows = cursor.fetchall()
+        return {"count": len(rows), "users": [dict(r) for r in rows]}
+
+
+@app.patch("/api/admin/chat/users/{user_id}/status")
+async def update_chat_user_status(user_id: str, data: ChatUserStatusUpdate, request: Request):
+    """
+    Admin Authority: Toggles student chat status between ACTIVE, MUTED, and BANNED.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    clean_id = user_id.strip()
+    status = data.status.strip().upper()
+    if status not in ["ACTIVE", "MUTED", "BANNED"]:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be ACTIVE, MUTED, or BANNED.")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, roll_no, email FROM community_users WHERE user_id = ?;", (clean_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Chat user not found.")
+
+        if status == "BANNED":
+            cursor.execute("""
+            UPDATE community_users
+            SET status = ?, session_token = NULL, session_revoked_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?;
+            """, (status, clean_id))
+        else:
+            cursor.execute("UPDATE community_users SET status = ? WHERE user_id = ?;", (status, clean_id))
+        log_audit_event("CHAT_USER_STATUS_CHANGE", ip, f"Admin updated chat user {clean_id} ({row['name']}) status to {status}", conn=conn)
+
+        return {
+            "success": True,
+            "user_id": clean_id,
+            "status": status,
+            "message": f"User {row['name']} ({row['roll_no']}) status updated to {status}."
+        }
+
+
+@app.delete("/api/admin/chat/users/{user_id}")
+async def delete_chat_user(user_id: str, request: Request):
+    """
+    Admin Authority: Kicks and removes user from the community chat registry.
+    """
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    clean_id = user_id.strip()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, roll_no, email FROM community_users WHERE user_id = ?;", (clean_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Chat user not found.")
+
+        cursor.execute("DELETE FROM community_users WHERE user_id = ?;", (clean_id,))
+        log_audit_event("CHAT_USER_KICKED", ip, f"Admin kicked and deleted chat user {clean_id} ({row['name']})", conn=conn)
+
+        return {
+            "success": True,
+            "message": f"User {row['name']} has been kicked from the chat registry."
+        }
+
+
+@app.get("/api/admin/audit-logs")
+async def list_security_audit_logs(request: Request, limit: int = 50):
+    """Admin endpoint: Fetches live security and coordinator audit logs."""
+    verify_admin_access(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT id, event_type, actor_ip, details, timestamp
+        FROM security_audit_logs ORDER BY id DESC LIMIT ?;
+        """, (limit,))
+        rows = cursor.fetchall()
+        return {"logs": [dict(r) for r in rows]}
+
+
+# --------------------------------------------------------------------------
+# MASTER ADMIN: REAL SMTP MAILER CONFIGURATION & TEST
+# --------------------------------------------------------------------------
+
+@app.get("/api/admin/smtp-config")
+async def get_admin_smtp_config(request: Request):
+    """Admin endpoint: Returns SMTP status only; credential values are never exposed."""
+    verify_admin_access(request)
+    cfg = get_smtp_config()
+    return {
+        "configured": bool(cfg["user"] and cfg["password"]),
+        "user": cfg["user"],
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "from_name": cfg["from_name"]
+    }
+
+
+@app.post("/api/admin/smtp-config")
+async def save_admin_smtp_config(request: Request):
+    """Reject legacy SMTP credential writes; configure SMTP in the server environment."""
+    verify_admin_access(request)
+    raise HTTPException(
+        status_code=410,
+        detail="SMTP credentials can no longer be saved through the admin console. Configure them in the server environment and restart the service.",
+    )
+
+
+@app.post("/api/admin/smtp-test")
+async def test_admin_smtp_delivery(data: SmtpTestRequest, request: Request):
+    """Admin endpoint: Sends a real test email to verify Google SMTP credentials live."""
+    verify_admin_access(request)
+    ip = get_client_ip(request)
+    test_email = data.test_email.strip().lower()
+
+    test_otp = f"{secrets.randbelow(900000) + 100000}"
+    res = send_real_smtp_email(test_email, "Administrator", test_otp)
+
+    if res["sent"]:
+        log_audit_event("SMTP_TEST_SUCCESS", ip, f"Test email successfully dispatched to {test_email}")
+        return {
+            "success": True,
+            "message": f"Test email successfully delivered to {test_email}! Check your Gmail inbox now."
+        }
+    else:
+        log_audit_event("SMTP_TEST_FAILED", ip, f"Test email failed for {test_email}: {res.get('reason')}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"SMTP Delivery Test Failed: {res.get('reason')}"
+        )
+
+
+# --------------------------------------------------------------------------
+# ROOT REDIRECT & STATIC FILES
+# --------------------------------------------------------------------------
+
+@app.get("/")
+async def root_redirect():
+    """Redirects root domain to index.html."""
+    index_file = os.path.join(DIRECTORY, "index.html")
+    if os.path.exists(index_file):
+        with open(index_file, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return JSONResponse({"message": "AssociationHub API is active. index.html not found."})
+
+
+# Mount entire nkocet-website directory for serving HTML, CSS, JS, images
+app.mount("/", StaticFiles(directory=DIRECTORY, html=True), name="static")
+
+
+# --------------------------------------------------------------------------
+# CLI ENTRY POINT
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8080))
+    print("============================================================")
+    print("   ASSOCIATIONHUB FULL-STACK SERVER (NKOCET 2026)")
+    print("============================================================")
+    print(f">> Server running at: http://127.0.0.1:{port}")
+    print(f">> API Docs: http://127.0.0.1:{port}/docs")
+    print(f">> Community Pulse: http://127.0.0.1:{port}/#community")
+    print(">> Admin PIN and cryptographic secret loaded from environment.")
+    print("============================================================")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+# Student registration is direct; legacy OTP endpoints are retained as tombstones.
+@app.post("/api/student/register/send-otp")
+async def student_register_send_otp(data: StudentSendOtpRequest, request: Request):
+    raise HTTPException(status_code=410, detail="Student Gmail OTP registration has been removed.")
+
+@app.post("/api/student/register/verify-otp")
+async def student_register_verify_otp(data: StudentVerifyOtpRequest, request: Request):
+    raise HTTPException(status_code=410, detail="Student Gmail OTP registration has been removed.")
+
+@app.post("/api/student/register/complete", status_code=201)
+async def student_register_complete(data: StudentCompleteRegistrationRequest, request: Request):
+    """Register a student directly after basic validation and duplicate checks."""
+    ip = get_client_ip(request)
+    name = data.name.strip()
+    email = data.email.strip().lower()
+    roll = data.roll_no.strip().upper()
+    dept = data.dept.strip()
+
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR roll_no = ? LIMIT 1;", (email, roll))
+        if cursor.fetchone():
+            log_audit_event("REGISTRATION_DUPLICATE_BLOCKED", ip, f"Blocked duplicate registration for {email} ({roll})", conn=conn)
+            raise HTTPException(status_code=400, detail="Duplicate Account: The Gmail address or roll number is already registered.")
+
+        # Duplicate check: Email
+        cursor.execute("SELECT student_id FROM registered_students WHERE email = ? LIMIT 1;", (email,))
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate Account: The Gmail address '{email}' is already registered."
+            )
+
+        # Duplicate check: Roll Number
+        cursor.execute("SELECT student_id FROM registered_students WHERE roll_no = ? LIMIT 1;", (roll,))
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate Account: College Roll Number '{roll}' is already registered."
+            )
+
+        # Secure password hashing (PBKDF2-HMAC-SHA256 with 100,000 iterations & unique salt)
+        pwd_hash, salt = hash_student_password(data.password)
+
+        # Generate unique Student ID
+        student_id = f"NKOCET-STU-2026-{secrets.token_hex(3).upper()}"
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        verified_at = ""
+
+        # Insert permanent student record
+        cursor.execute("""
+        INSERT INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?);
+        """, (student_id, name, email, roll, dept, pwd_hash, salt, verified_at, created_at))
+
+        # Synchronize into memberships table if not present so gate & verify know them
+        cursor.execute("SELECT pass_id FROM memberships WHERE roll_no = ?;", (roll,))
+        if not cursor.fetchone():
+            pass_id = f"NKOCET-2026-CSESA-{secrets.token_hex(3).upper()}"
+            sig = compute_hmac_signature(pass_id, roll, "CSESA")
+            verify_url = build_verification_url(pass_id, sig)
+            qr_b64 = make_qr_base64(verify_url)
+            cursor.execute("""
+            INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
+                VALUES (?, ?, ?, ?, ?, 'Second Year (SY)', 'CSESA', 'Registered Student', ?, 'ACTIVE', ?, ?);
+            """, (pass_id, name, roll, email, dept, qr_b64, sig, created_at))
+
+        session_token = f"STUDENT_SESSION.{secrets.token_hex(20)}"
+        log_audit_event("STUDENT_REGISTERED", ip, f"Registered new student {name} ({roll}) with Gmail {email} [ID: {student_id}]", conn=conn)
+
+        return {
+            "success": True,
+            "student_id": student_id,
+            "full_name": name,
+            "email": email,
+            "roll_no": roll,
+            "dept": dept,
+            "is_email_verified": False,
+            "email_verified_at": verified_at,
+            "created_at": created_at,
+            "session_token": session_token,
+            "message": f"Congratulations {name}! Your student account ({student_id}) has been created."
+        }
+
+
+# --------------------------------------------------------------------------
+# GMAIL VERIFICATION & OTP AUTHENTICATION
+# --------------------------------------------------------------------------
+
+@app.post("/api/auth/send-otp")
+async def send_email_otp(data: SendOtpRequest, request: Request):
+    """
+    Sends a 6-digit OTP code to student's Gmail for identity verification.
+    Security:
+    - 60-second resend cooldown.
+    - 5-minute (300 seconds) expiration limit.
+    - Cryptographically hashed OTP storage (SHA-256 + HMAC salt).
+    - Rate-limited per IP.
+    - Real-time Gmail SMTP dispatch only. No plaintext OTP or simulated credentials exposed.
+    """
+    ip = get_client_ip(request)
+    email = data.email.strip().lower()
+    roll = data.roll_no.strip().upper() if data.roll_no else None
+    now = time.time()
+
+    # Enforce Rejoin Approval Gate: Blocked or removed students require Admin approval
+    check_account_restriction(email, roll, data.name)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # 1. Enforce 60-second resend cooldown
+        cursor.execute("SELECT last_sent_at FROM email_otp_verifications WHERE email = ?;", (email,))
+        existing = cursor.fetchone()
+        if existing and existing["last_sent_at"]:
+            elapsed = now - existing["last_sent_at"]
+            if elapsed < 60:
+                remaining = int(60 - elapsed)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Cooldown active: Please wait {remaining} seconds before requesting a new OTP."
+                )
+
+        # 2. Prevent duplicate email registration if registering for membership pass
+        if request.url.path == "/api/auth/send-otp":
+            cursor.execute("SELECT pass_id FROM memberships WHERE email = ? LIMIT 1;", (email,))
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Duplicate Registration: The Gmail address '{email}' is already registered as an official member."
+                )
+
+        # 3. Secure 6-digit OTP generation & cryptographic SHA-256 hashing
+        otp_code = f"{secrets.randbelow(900000) + 100000}"
+        otp_hash = hash_otp(otp_code, email)
+        expires_at = now + 300  # Strictly 5 minutes validity
+
+        # 4. Store hashed OTP, timestamps, and reset attempt counter in database
+        if request.url.path == "/api/auth/send-otp" and (not roll or not data.association):
+            raise HTTPException(status_code=400, detail="Roll number and association are required for membership verification.")
+
+        cursor.execute("""
+        INSERT INTO email_otp_verifications
+            (email, otp_hash, otp_code, roll_no, association, session_id, expires_at, last_sent_at, attempts, is_verified, created_at)
+        VALUES (?, ?, '', ?, ?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+        ON CONFLICT(email) DO UPDATE SET
+            otp_hash = excluded.otp_hash,
+            otp_code = '',
+            roll_no = excluded.roll_no,
+            association = excluded.association,
+            session_id = excluded.session_id,
+            expires_at = excluded.expires_at,
+            last_sent_at = excluded.last_sent_at,
+            attempts = 0,
+            is_verified = 0,
+            verification_token = NULL,
+            verified_at = NULL;
+        """, (email, otp_hash, roll, data.association, data.session_id, expires_at, now))
+        log_audit_event("OTP_REQUESTED", ip, f"OTP requested for {email} (Roll: {roll})", conn=conn)
+
+    # 5. Dispatch real email via Gmail SMTP
+    clean_name = data.name.strip() if data.name else "Student"
+    smtp_res = send_real_smtp_email(email, clean_name, otp_code)
+
+    if not smtp_res["sent"]:
+        log_audit_event("EMAIL_DISPATCH_FAILED", ip, f"Gmail SMTP delivery failed to {email}: {smtp_res.get('reason')}")
+        raise HTTPException(
+            status_code=503,
+            detail="Verification email could not be sent. Please try again later."
+        )
+
+    log_audit_event("REAL_EMAIL_DISPATCHED", ip, f"Dispatched real email with OTP to {email}")
+    return {
+        "success": True,
+        "email": email,
+        "expires_in_seconds": 300,
+        "cooldown_seconds": 60,
+        "message": f"Verification code successfully dispatched to your Gmail inbox ({email})! Valid for 5 minutes."
+    }
+
+
+@app.post("/api/auth/verify-otp")
+async def verify_email_otp(data: VerifyOtpRequest, request: Request):
+    """
+    Verifies 6-digit OTP code against stored cryptographic hash.
+    Security:
+    - 5-minute expiration limit.
+    - Maximum 5 attempts lockout.
+    - Timing-attack safe hash comparison.
+    - Permanent database storage of verified status and verified_at timestamp.
+    """
+    ip = get_client_ip(request)
+    email = data.email.strip().lower()
+    otp = data.otp.strip()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT otp_hash, expires_at, attempts FROM email_otp_verifications
+        WHERE email = ? AND session_id = ? AND roll_no IS ? AND association IS ?;
+        """, (email, data.session_id, data.roll_no, data.association))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="No verification request found for this email. Please click 'Send OTP' first.")
+
+        if time.time() >= row["expires_at"]:
+            raise HTTPException(status_code=400, detail="OTP verification code has expired (5-minute validity limit). Please request a new code.")
+
+        if row["attempts"] >= 5:
+            raise HTTPException(status_code=429, detail="Too many incorrect OTP attempts (maximum 5). For security, this OTP has been locked. Please request a new code.")
+
+        # Cryptographic hash verification with timing-attack safe comparison
+        candidate_hash = hash_otp(otp, email)
+        if not hmac.compare_digest(row["otp_hash"] or "", candidate_hash):
+            new_attempts = row["attempts"] + 1
+            cursor.execute("""
+            UPDATE email_otp_verifications SET attempts = ?
+            WHERE email = ? AND session_id = ? AND roll_no IS ? AND association IS ?;
+            """, (new_attempts, email, data.session_id, data.roll_no, data.association))
+            conn.commit()
+            remaining = 5 - new_attempts
+            if remaining <= 0:
+                raise HTTPException(status_code=429, detail="Maximum 5 incorrect attempts reached. This OTP has been invalidated. Please request a new code.")
+            raise HTTPException(status_code=400, detail=f"Incorrect OTP verification code. {remaining} attempt(s) remaining.")
+
+        token = f"VERIFIED_{secrets.token_hex(16)}"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+        UPDATE email_otp_verifications
+        SET is_verified = 1,
+            verification_token = ?,
+            verified_at = ?,
+            attempts = 0,
+            otp_hash = NULL
+        WHERE email = ? AND session_id = ? AND roll_no IS ? AND association IS ?
+          AND otp_hash = ? AND is_verified = 0 AND expires_at > ?;
+        """, (token, now_str, email, data.session_id, data.roll_no, data.association, row["otp_hash"], time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=400, detail="OTP verification session expired or was already used. Please request a new code.")
+
+        log_audit_event("GMAIL_VERIFIED", ip, f"Verified email {email} successfully", conn=conn)
+
+        return {
+            "success": True,
+            "verified": True,
+            "email": email,
+            "verification_token": token,
+            "verified_at": now_str,
+            "message": f"Gmail identity verified successfully for {email}!"
+        }
+
+
+# --------------------------------------------------------------------------
+# GATED COMMUNITY CHAT AUTHENTICATION GATEWAY
+# --------------------------------------------------------------------------
+
+@app.post("/api/chat/auth/send-otp")
+async def send_chat_otp(data: SendOtpRequest, request: Request):
+    raise HTTPException(status_code=410, detail="Chat Gmail OTP verification has been removed.")
+
+
+@app.post("/api/chat/auth/verify-and-enter")
+async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
+    """Registers a chat identity directly without changing email verification state."""
+    ip = get_client_ip(request)
+    email = data.email.strip().lower()
+    name = data.name.strip()
+    roll = data.roll_no.strip().upper()
+    dept = data.dept.strip()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Check if user already exists and is banned
+        cursor.execute("SELECT user_id, status FROM community_users WHERE email = ? OR roll_no = ?;", (email, roll))
+        existing_user = cursor.fetchone()
+        if existing_user and existing_user["status"] == "BANNED":
+            raise HTTPException(status_code=403, detail="⛔ Access Denied: Your chat account has been banned by the Administrator.")
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_id = existing_user["user_id"] if existing_user else f"CHAT-USER-{secrets.token_hex(4).upper()}"
+        session_token = f"CHAT_SESSION.{secrets.token_hex(16)}"
+        session_expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute("""
+        INSERT INTO community_users
+            (user_id, name, roll_no, email, dept, status, session_token, session_expires_at, session_revoked_at, created_at, last_active)
+        VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, NULL, ?, ?)
+        ON CONFLICT(email) DO UPDATE SET
+            name = excluded.name,
+            roll_no = excluded.roll_no,
+            dept = excluded.dept,
+            session_token = excluded.session_token,
+            session_expires_at = excluded.session_expires_at,
+            session_revoked_at = NULL,
+            last_active = excluded.last_active;
+        """, (user_id, name, roll, email, dept, session_token, session_expires_at, now_str, now_str))
+
+        # Ensure student is recorded in memberships table so gate & verify know them
+        cursor.execute("SELECT pass_id FROM memberships WHERE roll_no = ?;", (roll,))
+        if not cursor.fetchone():
+            pass_id = f"NKOCET-2026-CSESA-{secrets.token_hex(3).upper()}"
+            sig = compute_hmac_signature(pass_id, roll, "CSESA")
+            qr_url = build_verification_url(pass_id, sig)
+            qr_b64 = make_qr_base64(qr_url)
+            cursor.execute("""
+            INSERT OR IGNORE INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
+            VALUES (?, ?, ?, ?, ?, 'Second Year (SY)', 'CSESA', 'Campus Pulse Community Peer', ?, 'ACTIVE', ?, ?);
+            """, (pass_id, name, roll, email, dept, qr_b64, sig, now_str))
+
+        log_audit_event("CHAT_GATEWAY_AUTHENTICATED", ip, f"Student {name} ({roll}) entered community chat via {email}", conn=conn)
+
+        return {
+            "success": True,
+            "message": f"Welcome to Campus Pulse, {name}!",
+            "token": session_token,
+            "user": {
+                "user_id": user_id,
+                "name": name,
+                "roll_no": roll,
+                "email": email,
+                "dept": dept,
+                "status": "ACTIVE"
+            }
+        }
+
+
+@app.get("/api/chat/auth/me")
+async def get_chat_current_user(request: Request):
+    """Validates active chat token and returns user profile & status."""
+    token = request.headers.get("X-Chat-Token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthenticated: No active chat session token.")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT user_id, name, roll_no, email, dept, status, created_at
+        FROM community_users
+        WHERE session_token = ? AND session_revoked_at IS NULL
+          AND session_expires_at IS NOT NULL
+          AND julianday(session_expires_at) > julianday('now')
+          AND status IN ('ACTIVE', 'MUTED');
+        """, (token.strip(),))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=401, detail="Chat session expired or invalid. Please enter the chat again.")
+
+        return {
+            "authenticated": True,
+            "user": dict(user)
+        }
+
+
+# --------------------------------------------------------------------------
+# MEMBERSHIP INTAKE & VERIFICATION
+# --------------------------------------------------------------------------
+
+@app.post("/api/memberships", status_code=201)
+async def create_membership(data: MembershipCreate, request: Request):
+    """
+    Intakes new student membership, verifies Gmail OTP, computes cryptographic HMAC-SHA256 signature & Base64 QR,
+    and persists in SQLite with duplicate checking and rate limiting.
+    """
+    ip = get_client_ip(request)
+    check_register_rate_limit(ip)
+
+    name = data.name.strip()
+    roll = data.roll.strip().upper()
+    dept = data.dept.strip()
+    year = data.year.strip()
+    assoc = data.association
+    email = (data.email or "").strip().lower()
+    otp_token = data.otp_token
+    session_id = data.session_id
+    interest = data.interest.strip() if data.interest else "General Technical Participation & Workshops"
+
+    # Enforce Rejoin Approval Gate: Blocked or removed students require Admin approval to rejoin
+    check_account_restriction(email, roll, name)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        if not email or not otp_token:
+            raise HTTPException(status_code=403, detail="Verify your email with the current OTP before retrieving or creating a membership pass.")
+
+        cursor.execute("""
+        UPDATE email_otp_verifications
+        SET is_verified = 0, verification_token = NULL, verified_at = NULL, otp_hash = NULL
+        WHERE email = ? AND roll_no = ? AND association = ? AND session_id = ?
+          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
+        """, (email, roll, assoc, session_id, otp_token, time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=403, detail="Email verification is missing, expired, used, or does not match this student and association. Please verify again.")
+
+        # 1. Existing Member Check: If student already registered for this club or has a pass,
+        # return their official Digital Pass only after consuming an OTP bound to this member.
+        cursor.execute("""
+        SELECT pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at
+        FROM memberships
+        WHERE (roll_no = ? AND association = ?) OR (email != '' AND email = ? AND association = ?)
+        ORDER BY rowid DESC LIMIT 1;
+        """, (roll, assoc, email, assoc))
+        existing = cursor.fetchone()
+
+        if existing:
+            pass_id = existing["pass_id"]
+            sig = existing["crypto_signature"] or compute_hmac_signature(pass_id, existing["roll_no"], existing["association"])
+            verify_url = build_verification_url(pass_id, sig)
+            qr_b64 = make_qr_base64(verify_url)
+
+            # Fetch or generate Verified Student ID
+            cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR (roll_no != '' AND roll_no = ?) LIMIT 1;", 
+                           (existing["email"], existing["roll_no"]))
+            stu_row = cursor.fetchone()
+            if stu_row:
+                verified_stu_id = stu_row["student_id"]
+            else:
+                verified_stu_id = f"NKOCET-STU-2026-{secrets.token_hex(3).upper()}"
+                pwd_hash, salt = hash_student_password("MemberPass@" + pass_id[-6:])
+                cursor.execute("""
+                INSERT OR IGNORE INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'ACTIVE', ?);
+                """, (verified_stu_id, existing["name"], existing["email"], existing["roll_no"], existing["dept"], pwd_hash, salt, existing["created_at"], existing["created_at"]))
+
+            return {
+                "pass_id": pass_id,
+                "student_id": verified_stu_id,
+                "name": existing["name"],
+                "roll_no": existing["roll_no"],
+                "dept": existing["dept"],
+                "year": existing["year"],
+                "association": existing["association"],
+                "interest": existing["interest"] or interest,
+                "qr_code_base64": qr_b64,
+                "status": existing["status"],
+                "crypto_signature": sig,
+                "verify_url": verify_url,
+                "created_at": existing["created_at"],
+                "is_existing": True,
+                "message": f"Welcome back, {existing['name']}! Your official Digi-Pass was loaded from the database."
+            }
+
+        # The verified token was consumed before the existing-member lookup above.
+        is_verified = 1
+
+        # 3. Generate unique Pass ID
+        unique_hex = secrets.token_hex(3).upper()
+        pass_id = f"NKOCET-2026-{assoc}-{unique_hex}"
+        
+        # Compute Cryptographic HMAC-SHA256 signature
+        sig = compute_hmac_signature(pass_id, roll, assoc)
+
+        # Generate verification QR Code with signature
+        verify_url = build_verification_url(pass_id, sig)
+        qr_b64 = make_qr_base64(verify_url)
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 4. Save into SQLite memberships table
+        cursor.execute("""
+        INSERT INTO memberships (pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?);
+        """, (pass_id, name, roll, email, dept, year, assoc, interest, qr_b64, sig, created_at))
+
+        # 5. Save into SQLite registered_students table for unified record keeping
+        cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR roll_no = ? LIMIT 1;", (email, roll))
+        stu_row = cursor.fetchone()
+        if stu_row:
+            verified_stu_id = stu_row["student_id"]
+        else:
+            verified_stu_id = f"NKOCET-STU-2026-{secrets.token_hex(3).upper()}"
+            pwd_hash, salt = hash_student_password("MemberPass@" + unique_hex)
+            cursor.execute("""
+            INSERT OR IGNORE INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?);
+            """, (verified_stu_id, name, email, roll, dept, pwd_hash, salt, is_verified, created_at, created_at))
+
+        log_audit_event("MEMBER_REGISTERED", ip, f"Registered {name} ({roll}) in {assoc} [Gmail: {email}] [Pass: {pass_id}] [Student ID: {verified_stu_id}]", conn=conn)
+
+        return {
+            "pass_id": pass_id,
+            "student_id": verified_stu_id,
+            "name": name,
+            "roll_no": roll,
+            "email": email,
+            "dept": dept,
+            "year": year,
+            "association": assoc,
+            "interest": interest,
+            "qr_code_base64": qr_b64,
+            "status": "ACTIVE",
+            "crypto_signature": sig,
+            "verify_url": verify_url,
+            "created_at": created_at,
+            "is_existing": False,
+            "message": f"Congratulations {name}! Your official Digi-Pass has been generated and permanently saved in the database."
+        }
+
+
+@app.get("/api/memberships")
+async def list_memberships(request: Request, association: Optional[str] = None):
+    """Lists registered members (excluding large QR base64 strings for speed)."""
+    verify_admin_access(request)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if association:
+            cursor.execute("""
+            SELECT pass_id, name, roll_no, dept, year, association, interest, status, created_at
+            FROM memberships WHERE association = ? ORDER BY created_at DESC;
+            """, (association.strip().upper(),))
+        else:
+            cursor.execute("""
+            SELECT pass_id, name, roll_no, dept, year, association, interest, status, created_at
+            FROM memberships ORDER BY created_at DESC;
+            """)
+        rows = cursor.fetchall()
+        return {"count": len(rows), "members": [dict(r) for r in rows]}
+
+
+@app.post("/api/memberships/lookup/send-otp")
+async def send_membership_lookup_otp(data: MembershipLookupOtpRequest, request: Request):
+    clean_q = data.query.strip()
+    with get_db() as conn:
+        row = conn.execute("""
+        SELECT roll_no, association, email, name
+        FROM memberships
+        WHERE pass_id = ? OR roll_no = ? OR email = ?
+        ORDER BY rowid DESC LIMIT 1;
+        """, (clean_q, clean_q.upper(), clean_q.lower())).fetchone()
+    if not row or (row["email"] or "").strip().lower() != data.email:
+        raise HTTPException(status_code=404, detail="No membership matching those details was found.")
+
+    otp_request = SendOtpRequest(
+        email=data.email,
+        name=row["name"],
+        roll_no=row["roll_no"],
+        association=row["association"],
+        session_id=data.session_id,
+    )
+    result = await send_email_otp(otp_request, request)
+    return {
+        **result,
+        "roll_no": row["roll_no"],
+        "association": row["association"],
+    }
+
+
+@app.post("/api/memberships/lookup")
+async def lookup_membership(data: MembershipLookupRequest, request: Request):
+    """
+    Retrieves a digital pass only after consuming an OTP bound to its email,
+    roll number, association, and verification session.
+    """
+    clean_q = data.query.strip()
+    if not clean_q or len(clean_q) < 2:
+        raise HTTPException(status_code=400, detail="Please enter a valid Roll No, PRN, Email, or Pass ID.")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT pass_id, name, roll_no, email, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at
+        FROM memberships
+        WHERE pass_id = ? OR roll_no = ? OR email = ?
+        ORDER BY rowid DESC LIMIT 1;
+        """, (clean_q, clean_q.upper(), clean_q.lower()))
+        m = cursor.fetchone()
+
+        if (not m or (m["email"] or "").strip().lower() != data.email
+                or m["roll_no"].strip().upper() != data.roll_no
+                or m["association"].strip().upper() != data.association):
+            raise HTTPException(status_code=404, detail="No membership matching those details was found.")
+
+        cursor.execute("""
+        UPDATE email_otp_verifications
+        SET is_verified = 0, verification_token = NULL, verified_at = NULL, otp_hash = NULL
+        WHERE email = ? AND roll_no = ? AND association = ? AND session_id = ?
+          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
+        """, (data.email, data.roll_no, data.association, data.session_id, data.otp_token, time.time()))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=403, detail="Email verification is missing, expired, used, or does not match this pass. Please verify again.")
+
+        pass_id = m["pass_id"]
+        sig = m["crypto_signature"] or compute_hmac_signature(pass_id, m["roll_no"], m["association"])
+        verify_url = build_verification_url(pass_id, sig)
+        qr_b64 = make_qr_base64(verify_url)
+
+        cursor.execute("SELECT student_id FROM registered_students WHERE email = ? OR (roll_no != '' AND roll_no = ?) LIMIT 1;", (m["email"], m["roll_no"]))
+        s_row = cursor.fetchone()
+        student_id = s_row["student_id"] if s_row else f"NKOCET-STU-2026-{pass_id[-6:]}"
+
+        return {
+            "pass_id": pass_id,
+            "student_id": student_id,
+            "name": m["name"],
+            "roll_no": m["roll_no"],
+            "dept": m["dept"],
+            "year": m["year"],
+            "association": m["association"],
+            "interest": m["interest"],
+            "qr_code_base64": qr_b64,
+            "status": m["status"],
+            "crypto_signature": sig,
+            "verify_url": verify_url,
+            "created_at": m["created_at"]
+        }
+
+
+@app.get("/api/memberships/verify/{pass_id}")
+async def verify_membership(pass_id: str, request: Request, sig: Optional[str] = None):
+    """
+    Public QR gate check-in verification for membership passes with cryptographic signature validation.
+    """
+    clean_id = pass_id.strip()
+    ip = get_client_ip(request)
+    check_gate_verify_rate_limit(ip)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT pass_id, name, roll_no, dept, year, association, interest, qr_code_base64, status, crypto_signature, created_at
+        FROM memberships WHERE pass_id = ?;
+        """, (clean_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            log_audit_event("GATE_VERIFY_NOT_FOUND", ip, f"Pass {clean_id} not found in ledger")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Membership pass '{clean_id}' was not found or is invalid."
+            )
+
+        status = row["status"] if "status" in row.keys() and row["status"] else "ACTIVE"
+        expected_sig = compute_hmac_signature(row["pass_id"], row["roll_no"], row["association"])
+        sig_valid = bool(sig) and hmac.compare_digest(expected_sig, sig)
+        if not sig_valid:
+            log_audit_event(
+                "GATE_VERIFY_INVALID_SIGNATURE",
+                ip,
+                f"Invalid or missing signature for pass {clean_id}",
+                conn=conn,
+            )
+            return {
+                "valid": False,
+                "status": "INVALID_SIGNATURE",
+                "signature_verified": False,
+                "message": "The pass signature is missing or invalid. Scan the original signed QR code.",
+            }
+        verify_url = build_verification_url(row["pass_id"], expected_sig)
+        qr_b64 = make_qr_base64(verify_url)
+
+        if status == "SUSPENDED":
+            log_audit_event("GATE_VERIFY_SUSPENDED", ip, f"Suspended pass inspected: {clean_id}")
+            return {
+                "valid": False,
+                "status": "SUSPENDED",
+                "signature_verified": sig_valid,
+                "crypto_signature": expected_sig,
+                "message": "This membership pass is TEMPORARILY SUSPENDED by college administration. Access denied at gate.",
+                "member": {
+                    "pass_id": row["pass_id"],
+                    "name": row["name"],
+                    "roll_no": row["roll_no"],
+                    "dept": row["dept"],
+                    "year": row["year"],
+                    "association": row["association"],
+                    "interest": row["interest"],
+                    "status": "SUSPENDED",
+                    "qr_code_base64": qr_b64,
+                    "verify_url": verify_url,
+                    "crypto_signature": expected_sig,
+                    "created_at": row["created_at"]
+                }
+            }
+
+        return {
+            "valid": True,
+            "status": "ACTIVE",
+            "signature_verified": sig_valid,
+            "crypto_signature": expected_sig,
+            "security_seal": "NKOCET-DIGITAL-LEDGER-VERIFIED",
+            "member": {
+                "pass_id": row["pass_id"],
+                "name": row["name"],
+                "roll_no": row["roll_no"],
+                "dept": row["dept"],
+                "year": row["year"],
+                "association": row["association"],
+                "interest": row["interest"],
+                "status": status,
+                "qr_code_base64": qr_b64,
+                "verify_url": verify_url,
+                "crypto_signature": expected_sig,
+                "created_at": row["created_at"]
+            }
+        }
+
+
+@app.post("/api/gate/check-in")
+async def record_gate_checkin(data: GateCheckinRequest, request: Request):
+    """
+    Public / Coordinator Gate Scanner: Validates student pass status and logs attendance.
+    Denies entry if pass is suspended or invalid.
+    """
+    clean_id = data.pass_id.strip()
+    checkpoint = data.checkpoint.strip() if data.checkpoint else "Central Gate / Main Campus"
+    ip = get_client_ip(request)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT pass_id, name, roll_no, dept, year, association, status
+        FROM memberships WHERE pass_id = ?;
+        """, (clean_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            log_audit_event("GATE_CHECKIN_FAILED", ip, f"Invalid pass ID attempted: {clean_id} at {checkpoint}")
+            raise HTTPException(status_code=404, detail=f"Pass ID '{clean_id}' not found in registry.")
+
+        status = row["status"] if "status" in row.keys() and row["status"] else "ACTIVE"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if status == "SUSPENDED":
+            log_audit_event("GATE_CHECKIN_DENIED", ip, f"Suspended pass denied entry: {clean_id} ({row['name']}) at {checkpoint}", conn=conn)
+            cursor.execute("""
+            INSERT INTO gate_checkins (pass_id, student_name, roll_no, association, checkpoint, status, timestamp)
+            VALUES (?, ?, ?, ?, ?, 'DENIED_SUSPENDED', ?);
+            """, (clean_id, row["name"], row["roll_no"], row["association"], checkpoint, now_str))
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access Denied: Membership pass for {row['name']} is currently SUSPENDED by administration."
+            )
+
+        cursor.execute("""
+        INSERT INTO gate_checkins (pass_id, student_name, roll_no, association, checkpoint, status, timestamp)
+        VALUES (?, ?, ?, ?, ?, 'ENTRY_GRANTED', ?);
+        """, (clean_id, row["name"], row["roll_no"], row["association"], checkpoint, now_str))
+
+        log_audit_event("GATE_CHECKIN_SUCCESS", ip, f"Student {row['name']} ({row['roll_no']}) checked in at {checkpoint}", conn=conn)
+
+        return {
+            "success": True,
+            "status": "ENTRY_GRANTED",
+            "message": f"Gate access granted for {row['name']} ({row['association']})",
+            "student_name": row["name"],
+            "roll_no": row["roll_no"],
+            "dept": row["dept"],
+            "year": row["year"],
+            "association": row["association"],
+            "checkpoint": checkpoint,
+            "timestamp": now_str,
+            "pass_id": clean_id
+        }
+
+
+@app.get("/api/gate/checkins")
+async def list_gate_checkins(limit: int = 50, pass_id: Optional[str] = None):
+    """Returns recent gate attendance logs."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if pass_id:
+            cursor.execute("""
+            SELECT id, pass_id, student_name, roll_no, association, checkpoint, status, timestamp
+            FROM gate_checkins WHERE pass_id = ? ORDER BY id DESC LIMIT ?;
+            """, (pass_id.strip(), limit))
+        else:
+            cursor.execute("""
+            SELECT id, pass_id, student_name, roll_no, association, checkpoint, status, timestamp
+            FROM gate_checkins ORDER BY id DESC LIMIT ?;
+            """, (limit,))
+        rows = cursor.fetchall()
+        return {"checkins": [dict(r) for r in rows]}
+
+
+@app.delete("/api/memberships/{pass_id}")
+async def delete_membership(pass_id: str, request: Request):
+    """
+    Admin endpoint: Permanently revokes and removes a registered member pass from the database.
+    Requires Administrator Authorization.
+    """
+    verify_admin_access(request)
+    clean_id = pass_id.strip()
+    ip = get_client_ip(request)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT pass_id, name, roll_no, association, email FROM memberships WHERE pass_id = ?;", (clean_id,))
+        existing = cursor.fetchone()
+        if not existing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Membership pass '{clean_id}' was not found in the registry."
+            )
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if existing["email"] or existing["roll_no"]:
+            cursor.execute("""
+            INSERT INTO account_restrictions (email, roll_no, name, reason, status, restricted_at)
+            VALUES (?, ?, ?, 'Membership Pass Revoked by Administrator', 'RESTRICTED', ?);
+            """, (existing["email"] or "", existing["roll_no"], existing["name"], now_str))
+
+        cursor.execute("DELETE FROM memberships WHERE pass_id = ?;", (clean_id,))
+        log_audit_event("MEMBER_REVOKED_DELETED", ip, f"Revoked & deleted pass {clean_id} for {existing['name']} (Roll: {existing['roll_no']})", conn=conn)
+        return {
+            "success": True,
+            "message": f"Membership for {existing['name']} (Roll: {existing['roll_no']}, {existing['association']}) has been successfully revoked and removed.",
+            "pass_id": clean_id
+        }
+
+
+# --------------------------------------------------------------------------
+# CAMPUS PULSE: STUDENT EXPERIENCE & DISCUSSION HUB
+# --------------------------------------------------------------------------
+
+@app.get("/api/community/posts")
+async def list_community_posts(
+    category: Optional[str] = None,
+    dept: Optional[str] = None,
+    search: Optional[str] = None
+):
+    """Lists community posts with comment counts and like tallies."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        query = """
+        SELECT p.post_id, p.author_name, p.roll_no, p.dept, p.year, p.category, p.title, p.content, p.is_anonymous, p.likes, p.created_at,
+               COUNT(c.comment_id) AS comment_count
+        FROM community_posts p
+        LEFT JOIN community_comments c ON p.post_id = c.post_id
+        WHERE 1=1
+        """
+        params = []
+
+        if category and category.upper() != "ALL":
+            query += " AND p.category = ?"
+            params.append(category.strip().upper())
+
+        if dept and dept.upper() != "ALL":
+            query += " AND p.dept LIKE ?"
+            params.append(f"%{dept.strip()}%")
+
+        if search:
+            query += " AND (p.title LIKE ? OR p.content LIKE ?)"
+            s = f"%{search.strip()}%"
+            params.extend([s, s])
+
+        query += " GROUP BY p.post_id ORDER BY p.created_at DESC;"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        posts = []
+        for r in rows:
+            p = dict(r)
+            if p["is_anonymous"] == 1:
+                p["author_name"] = "Anonymous Orchidite"
+                p["roll_no"] = "Verified Student"
+            posts.append(p)
+
+        return {"count": len(posts), "posts": posts}
+
+
+@app.post("/api/community/posts", status_code=201)
+async def create_community_post(data: CommunityPostCreate, request: Request):
+    """
+    Submits a new student experience post.
+    Security Gate: Verified against active registered memberships or community_users in SQLite!
+    Enforces Campus Anti-Troll Shield and checks Mute/Ban status.
+    """
+    ip = get_client_ip(request)
+    roll = data.roll_no.strip().upper()
+    cat = data.category.strip().upper()
+    if cat not in ALLOWED_CATEGORIES:
+        cat = "GENERAL"
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Campus Anti-Troll Filter
+        check_anti_troll(data.title, roll, ip, conn=conn)
+        check_anti_troll(data.content, roll, ip, conn=conn)
+        check_rate_limit(roll)
+        check_account_restriction("", roll_no=roll)
+
+        # Check if student is BANNED or MUTED
+        cursor.execute("SELECT user_id, status FROM community_users WHERE roll_no = ?;", (roll,))
+        cuser = cursor.fetchone()
+        if cuser:
+            if cuser["status"] == "BANNED":
+                raise HTTPException(status_code=403, detail="⛔ Access Revoked: Your community chat account has been banned by the Administrator.")
+            if cuser["status"] == "MUTED":
+                raise HTTPException(status_code=403, detail="⏸️ Account Muted: You have been temporarily muted from posting by the Administrator.")
+
+        # Verify student exists in memberships or community_users
+        cursor.execute("SELECT name, roll_no, dept, year FROM memberships WHERE roll_no = ? LIMIT 1;", (roll,))
+        verified = cursor.fetchone()
+        if not verified:
+            cursor.execute("SELECT name, roll_no, dept FROM community_users WHERE roll_no = ? LIMIT 1;", (roll,))
+            c_verified = cursor.fetchone()
+            if not c_verified:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Security Gate: Roll No '{roll}' was not found in the student registry."
+                )
+            verified = {"name": c_verified["name"], "roll_no": c_verified["roll_no"], "dept": c_verified["dept"], "year": "Second Year (SY)"}
+
+        post_id = f"POST-2026-{secrets.token_hex(4).upper()}"
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute("""
+        INSERT INTO community_posts (post_id, author_name, roll_no, dept, year, category, title, content, is_anonymous, likes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);
+        """, (
+            post_id,
+            verified["name"] if not data.is_anonymous else data.author_name,
+            roll,
+            verified["dept"],
+            verified["year"],
+            cat,
+            data.title,
+            data.content,
+            1 if data.is_anonymous else 0,
+            created_at
+        ))
+
+        # Update last_active in community_users
+        cursor.execute("UPDATE community_users SET last_active = ? WHERE roll_no = ?;", (created_at, roll))
+
+        return {
+            "success": True,
+            "post_id": post_id,
+            "message": "Your experience has been verified and published to Campus Pulse!"
+        }
+
+
+@app.post("/api/community/posts/{post_id}/like")
+async def like_community_post(post_id: str):
+    """Upvotes an experience post."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT likes FROM community_posts WHERE post_id = ?;", (post_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Post not found.")
+
+        new_likes = row["likes"] + 1
+        cursor.execute("UPDATE community_posts SET likes = ? WHERE post_id = ?;", (new_likes, post_id))
+        return {"post_id": post_id, "likes": new_likes}
+
+
+@app.get("/api/community/posts/{post_id}/comments")
+async def get_post_comments(post_id: str):
+    """Fetches replies to a discussion thread."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT comment_id, post_id, author_name, roll_no, content, created_at
+        FROM community_comments WHERE post_id = ? ORDER BY created_at ASC;
+        """, (post_id,))
+        rows = cursor.fetchall()
+        return {"comments": [dict(r) for r in rows]}
+
+
+@app.post("/api/community/posts/{post_id}/comments", status_code=201)
+async def create_post_comment(post_id: str, data: CommunityCommentCreate, request: Request):
+    """
+    Posts a reply to a discussion thread.
+    Security Gate: Verified against active registered memberships or community_users in SQLite!
+    Enforces Campus Anti-Troll Shield.
+    """
+    ip = get_client_ip(request)
+    roll = data.roll_no.strip().upper()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Anti-troll check
+        check_anti_troll(data.content, roll, ip, conn=conn)
+
+        # Check if student is BANNED or MUTED
+        cursor.execute("SELECT status FROM community_users WHERE roll_no = ?;", (roll,))
+        cuser = cursor.fetchone()
+        if cuser:
+            if cuser["status"] == "BANNED":
+                raise HTTPException(status_code=403, detail="⛔ Access Denied: Your chat account has been banned.")
+            if cuser["status"] == "MUTED":
+                raise HTTPException(status_code=403, detail="⏸️ Account Muted: You cannot reply while muted by the Administrator.")
+
+        # Verify student exists in memberships or community_users
+        cursor.execute("SELECT name, roll_no FROM memberships WHERE roll_no = ? LIMIT 1;", (roll,))
+        verified = cursor.fetchone()
+        if not verified:
+            cursor.execute("SELECT name, roll_no FROM community_users WHERE roll_no = ? LIMIT 1;", (roll,))
+            c_verified = cursor.fetchone()
+            if not c_verified:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Security Gate: Roll No '{roll}' is not registered."
                 )
             verified = {"name": c_verified["name"], "roll_no": c_verified["roll_no"]}
 

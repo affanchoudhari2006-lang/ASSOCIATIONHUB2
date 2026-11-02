@@ -281,10 +281,10 @@ class RenderDeploymentConfigurationTests(unittest.TestCase):
                     }):
                         with self.assertRaises(HTTPException) as raised:
                             asyncio.run(server.student_register_send_otp(data, request))
-                self.assertEqual(raised.exception.status_code, 503)
+                self.assertEqual(raised.exception.status_code, 410)
                 self.assertEqual(
                     raised.exception.detail,
-                    "Verification email could not be sent. Please try again later.",
+                    "Student Gmail OTP registration has been removed.",
                 )
                 with closing(sqlite3.connect(server.DB_PATH)) as conn:
                     self.assertEqual(
@@ -305,7 +305,7 @@ class RenderDeploymentConfigurationTests(unittest.TestCase):
                         "SELECT otp_code, is_verified FROM email_otp_verifications WHERE email = ?",
                         ("new-student@college.edu",),
                     ).fetchone()
-                self.assertEqual(tuple(verification), ("", 0))
+                self.assertIsNone(verification)
             finally:
                 server.DB_PATH = original_db_path
                 server.NKOCET_CRYPTO_SECRET = original_crypto_secret
