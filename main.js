@@ -868,207 +868,6 @@ function initMembershipModal() {
   const formWrap = document.getElementById('membership-form-wrap');
   const closeBtns = overlay.querySelectorAll('.membership-modal-close, .btn-pass-close');
 
-  let verifiedEmailToken = null;
-  let isEmailVerified = false;
-  let verifiedEmail = null;
-  let verifiedRoll = null;
-  let verifiedAssociation = null;
-  let otpSessionId = null;
-  let otpRoll = null;
-  let otpTimerInterval = null;
-
-  // Gmail OTP Send Handler
-  window.sendGmailOtp = async function() {
-    const emailInput = document.getElementById('member-email');
-    const rollInput = document.getElementById('member-roll');
-    const associationInput = document.getElementById('member-association');
-    const emailStatus = document.getElementById('email-verify-status');
-    const otpWrap = document.getElementById('otp-entry-wrap');
-    const timerEl = document.getElementById('otp-timer');
-    const hintEl = document.getElementById('otp-hint-msg');
-    const sendBtn = document.getElementById('btn-send-otp');
-
-    const email = (emailInput ? emailInput.value : '').trim().toLowerCase();
-    const roll = (rollInput ? rollInput.value : '').trim();
-    const association = (associationInput ? associationInput.value : '').trim().toUpperCase();
-
-    if (!email || !email.includes('@')) {
-      alert('Please enter a valid student Gmail address first (e.g. yourname@gmail.com).');
-      if (emailInput) emailInput.focus();
-      return;
-    }
-
-    isEmailVerified = false;
-    verifiedEmailToken = null;
-    verifiedEmail = null;
-    verifiedRoll = null;
-    verifiedAssociation = null;
-    otpRoll = roll.toUpperCase();
-    otpSessionId = window.createVerificationSessionId();
-
-    if (sendBtn) {
-      sendBtn.disabled = true;
-      sendBtn.innerHTML = `<span>Sending... ⏳</span>`;
-    }
-
-    try {
-      const res = await apiFetch('/api/auth/send-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email,
-          roll_no: roll,
-          association: association,
-          session_id: otpSessionId
-        })
-      });
-      const data = await res.json();
-
-      if (res.ok) {
-        if (otpWrap) otpWrap.style.display = 'block';
-        if (emailStatus) {
-          emailStatus.style.color = '#ff9800';
-          emailStatus.textContent = '⏳ Enter 6-Digit OTP';
-        }
-        if (typeof showToast === 'function') {
-          showToast(`Verification code sent to ${email}`, 'gold');
-        }
-
-        // Real email delivery notification
-        if (hintEl) {
-          hintEl.style.display = 'block';
-          hintEl.style.color = '#00e676';
-          hintEl.innerHTML = `📧 <strong>Verification code dispatched to ${email}!</strong> Check your Gmail inbox (or Spam folder) for your 6-digit OTP.`;
-        }
-        const otpInput = document.getElementById('member-otp');
-        if (otpInput) {
-          otpInput.value = '';
-          otpInput.focus();
-        }
-
-        // 5-minute (300s) expiration timer countdown
-        let remainingSeconds = 300;
-        if (otpTimerInterval) clearInterval(otpTimerInterval);
-        otpTimerInterval = setInterval(() => {
-          remainingSeconds--;
-          if (remainingSeconds <= 0) {
-            clearInterval(otpTimerInterval);
-            if (timerEl) timerEl.textContent = 'Expired';
-            if (emailStatus) emailStatus.textContent = '⚠️ OTP Expired';
-          } else {
-            const m = Math.floor(remainingSeconds / 60);
-            const s = remainingSeconds % 60;
-            if (timerEl) timerEl.textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
-          }
-        }, 1000);
-
-        // 60-second Resend Cooldown
-        let cooldown = 60;
-        sendBtn.disabled = true;
-        sendBtn.innerHTML = `<span>Resend in ${cooldown}s ⏳</span>`;
-        const cooldownTimer = setInterval(() => {
-          cooldown--;
-          if (cooldown <= 0) {
-            clearInterval(cooldownTimer);
-            sendBtn.disabled = false;
-            sendBtn.innerHTML = `<span>Resend OTP ✉️</span>`;
-          } else {
-            sendBtn.innerHTML = `<span>Resend in ${cooldown}s ⏳</span>`;
-          }
-        }, 1000);
-      } else {
-        alert("Verification Error: " + (data.detail || "Unable to send verification email."));
-        if (sendBtn) {
-          sendBtn.disabled = false;
-          sendBtn.innerHTML = `<span>Send OTP ✉️</span>`;
-        }
-      }
-    } catch (err) {
-      alert('Error contacting server: ' + err.message);
-      if (sendBtn) {
-        sendBtn.disabled = false;
-        sendBtn.innerHTML = `<span>Send OTP ✉️</span>`;
-      }
-    }
-  };
-
-  // Gmail OTP Verify Handler
-  window.verifyGmailOtp = async function() {
-    const emailInput = document.getElementById('member-email');
-    const associationInput = document.getElementById('member-association');
-    const otpInput = document.getElementById('member-otp');
-    const emailStatus = document.getElementById('email-verify-status');
-    const otpWrap = document.getElementById('otp-entry-wrap');
-    const verifyBtn = document.getElementById('btn-verify-otp');
-    const sendBtn = document.getElementById('btn-send-otp');
-
-    const email = (emailInput ? emailInput.value : '').trim().toLowerCase();
-    const association = (associationInput ? associationInput.value : '').trim().toUpperCase();
-    const otp = (otpInput ? otpInput.value : '').trim();
-
-    if (!otp || otp.length < 4) {
-      alert('Please enter the 6-digit OTP code received in your Gmail.');
-      if (otpInput) otpInput.focus();
-      return;
-    }
-
-    if (verifyBtn) {
-      verifyBtn.disabled = true;
-      verifyBtn.innerHTML = `<span>Verifying...</span>`;
-    }
-
-    try {
-      const res = await apiFetch('/api/auth/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email,
-          otp: otp,
-          roll_no: otpRoll,
-          association: association,
-          session_id: otpSessionId
-        })
-      });
-      const data = await res.json();
-
-      if (res.ok && data.verified) {
-        isEmailVerified = true;
-        verifiedEmailToken = data.verification_token;
-        verifiedEmail = email;
-        verifiedRoll = otpRoll;
-        verifiedAssociation = association;
-        if (otpTimerInterval) clearInterval(otpTimerInterval);
-
-        if (emailStatus) {
-          emailStatus.style.color = '#00e676';
-          emailStatus.innerHTML = `✓ Gmail Verified (${email})`;
-        }
-        if (emailInput) {
-          emailInput.readOnly = true;
-          emailInput.style.borderColor = '#00e676';
-        }
-        if (sendBtn) sendBtn.style.display = 'none';
-        if (otpWrap) otpWrap.style.display = 'none';
-
-        if (typeof showToast === 'function') {
-          showToast(`Gmail identity verified successfully!`, 'success');
-        }
-      } else {
-        alert('Verification Failed: ' + (data.detail || 'Incorrect OTP code.'));
-        if (verifyBtn) {
-          verifyBtn.disabled = false;
-          verifyBtn.innerHTML = `<span>Verify Code ✓</span>`;
-        }
-      }
-    } catch (err) {
-      alert('Error contacting server: ' + err.message);
-      if (verifyBtn) {
-        verifyBtn.disabled = false;
-        verifyBtn.innerHTML = `<span>Verify Code ✓</span>`;
-      }
-    }
-  };
-
   const assocToDeptMap = {
     'CSESA': 'Computer Science & Engineering',
     'MESA': 'Mechanical Engineering',
@@ -1081,15 +880,14 @@ function initMembershipModal() {
   window.openMembershipModal = function(preselectedDept) {
     if (preselectedDept) {
       const assocSelect = document.getElementById('member-association');
-      if (assocSelect) {
-        assocSelect.value = preselectedDept;
-      }
+      if (assocSelect) assocSelect.value = preselectedDept;
+
       const deptSelect = document.getElementById('member-dept');
       if (deptSelect && assocToDeptMap[preselectedDept]) {
         deptSelect.value = assocToDeptMap[preselectedDept];
       }
     }
-    // Clear any previous error banner
+
     const existingAlert = document.getElementById('membership-alert');
     if (existingAlert) existingAlert.remove();
 
@@ -1117,7 +915,6 @@ function initMembershipModal() {
     }
   });
 
-  // Zero-Failure Resilient Membership Pass Generator
   if (form) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1158,8 +955,6 @@ function initMembershipModal() {
       if (nameInput) nameInput.style.borderColor = '';
       if (rollInput) rollInput.style.borderColor = '';
 
-      const hasCurrentVerification = isEmailVerified && verifiedEmailToken &&
-        verifiedEmail === email && verifiedRoll === roll && verifiedAssociation === association;
 
       // Submit Button Loading State
       const submitBtn = form.querySelector('button[type="submit"]');
@@ -1173,8 +968,6 @@ function initMembershipModal() {
         name: name,
         roll: roll,
         email: email,
-        otp_token: hasCurrentVerification ? verifiedEmailToken : null,
-        session_id: hasCurrentVerification ? otpSessionId : null,
         dept: dept,
         year: year,
         association: association,
