@@ -29,8 +29,7 @@ window.processOfflineMembershipQueue = async function() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            ...item,
-            session_id: item.session_id || window.createVerificationSessionId()
+            ...item
           })
         });
         if (!res.ok) {
@@ -971,8 +970,7 @@ function initMembershipModal() {
         dept: dept,
         year: year,
         association: association,
-        interest: interest || 'General Technical Participation & Workshops',
-        session_id: window.createVerificationSessionId()
+        interest: interest || 'General Technical Participation & Workshops'
       };
 
       try {

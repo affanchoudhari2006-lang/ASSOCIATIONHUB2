@@ -71,7 +71,7 @@ class MembershipOtpSecurityTests(unittest.TestCase):
                 ))
 
     def membership(self, *, token=None, roll="TEST-C-62", association="CSESA",
-                   email="student@example.edu", session_id="a" * 32):
+                   email="student@example.edu", session_id=None):
         return server.MembershipCreate(
             name="Synthetic Student",
             roll=roll,

@@ -1423,11 +1423,13 @@ class MembershipCreate(BaseModel):
     interest: Optional[str] = Field(None, max_length=250)
     email: Optional[str] = Field(None, max_length=120)
     otp_token: Optional[str] = Field(None, max_length=100)
-    session_id: str = Field(..., min_length=32, max_length=64)
+    session_id: Optional[str] = Field(None, min_length=32, max_length=64)
 
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, v: str) -> str:
+        if v is None:
+            return v
         if not re.fullmatch(r"[a-fA-F0-9-]{32,64}", v):
             raise ValueError("Invalid verification session")
         return v.lower()
