@@ -1897,6 +1897,7 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
     name = data.name.strip()
     roll = data.roll_no.strip().upper()
     dept = data.dept.strip()
+    check_account_restriction(email, roll, name)
 
     with get_db() as conn:
         cursor = conn.cursor()
@@ -2006,21 +2007,11 @@ async def create_membership(data: MembershipCreate, request: Request):
 
     # Enforce Rejoin Approval Gate: Blocked or removed students require Admin approval to rejoin
     check_account_restriction(email, roll, name)
+    if not email:
+        raise HTTPException(status_code=403, detail="A valid student email address is required.")
 
     with get_db() as conn:
         cursor = conn.cursor()
-
-        if not email or not otp_token:
-            raise HTTPException(status_code=403, detail="Verify your email with the current OTP before retrieving or creating a membership pass.")
-
-        cursor.execute("""
-        UPDATE email_otp_verifications
-        SET is_verified = 0, verification_token = NULL, verified_at = NULL, otp_hash = NULL
-        WHERE email = ? AND roll_no = ? AND association = ? AND session_id = ?
-          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
-        """, (email, roll, assoc, session_id, otp_token, time.time()))
-        if cursor.rowcount != 1:
-            raise HTTPException(status_code=403, detail="Email verification is missing, expired, used, or does not match this student and association. Please verify again.")
 
         # 1. Existing Member Check: If student already registered for this club or has a pass,
         # return their official Digital Pass only after consuming an OTP bound to this member.
@@ -2049,8 +2040,8 @@ async def create_membership(data: MembershipCreate, request: Request):
                 pwd_hash, salt = hash_student_password("MemberPass@" + pass_id[-6:])
                 cursor.execute("""
                 INSERT OR IGNORE INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'ACTIVE', ?);
-                """, (verified_stu_id, existing["name"], existing["email"], existing["roll_no"], existing["dept"], pwd_hash, salt, existing["created_at"], existing["created_at"]))
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', 'ACTIVE', ?);
+                """, (verified_stu_id, existing["name"], existing["email"], existing["roll_no"], existing["dept"], pwd_hash, salt, existing["created_at"]))
 
             return {
                 "pass_id": pass_id,
@@ -2070,8 +2061,7 @@ async def create_membership(data: MembershipCreate, request: Request):
                 "message": f"Welcome back, {existing['name']}! Your official Digi-Pass was loaded from the database."
             }
 
-        # The verified token was consumed before the existing-member lookup above.
-        is_verified = 1
+        is_verified = 0
 
         # 3. Generate unique Pass ID
         unique_hex = secrets.token_hex(3).upper()
@@ -2101,8 +2091,8 @@ async def create_membership(data: MembershipCreate, request: Request):
             pwd_hash, salt = hash_student_password("MemberPass@" + unique_hex)
             cursor.execute("""
             INSERT OR IGNORE INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?);
-            """, (verified_stu_id, name, email, roll, dept, pwd_hash, salt, is_verified, created_at, created_at))
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', 'ACTIVE', ?);
+            """, (verified_stu_id, name, email, roll, dept, pwd_hash, salt, created_at))
 
         log_audit_event("MEMBER_REGISTERED", ip, f"Registered {name} ({roll}) in {assoc} [Gmail: {email}] [Pass: {pass_id}] [Student ID: {verified_stu_id}]", conn=conn)
 
@@ -3636,6 +3626,7 @@ async def verify_and_enter_chat(data: ChatRegisterRequest, request: Request):
     name = data.name.strip()
     roll = data.roll_no.strip().upper()
     dept = data.dept.strip()
+    check_account_restriction(email, roll, name)
 
     with get_db() as conn:
         cursor = conn.cursor()
@@ -3745,22 +3736,11 @@ async def create_membership(data: MembershipCreate, request: Request):
 
     # Enforce Rejoin Approval Gate: Blocked or removed students require Admin approval to rejoin
     check_account_restriction(email, roll, name)
+    if not email:
+        raise HTTPException(status_code=403, detail="A valid student email address is required.")
 
     with get_db() as conn:
         cursor = conn.cursor()
-
-        if not email or not otp_token:
-            raise HTTPException(status_code=403, detail="Verify your email with the current OTP before retrieving or creating a membership pass.")
-
-        cursor.execute("""
-        UPDATE email_otp_verifications
-        SET is_verified = 0, verification_token = NULL, verified_at = NULL, otp_hash = NULL
-        WHERE email = ? AND roll_no = ? AND association = ? AND session_id = ?
-          AND verification_token = ? AND is_verified = 1 AND expires_at > ?;
-        """, (email, roll, assoc, session_id, otp_token, time.time()))
-        if cursor.rowcount != 1:
-            raise HTTPException(status_code=403, detail="Email verification is missing, expired, used, or does not match this student and association. Please verify again.")
-
         # 1. Existing Member Check: If student already registered for this club or has a pass,
         # return their official Digital Pass only after consuming an OTP bound to this member.
         cursor.execute("""
@@ -3788,8 +3768,8 @@ async def create_membership(data: MembershipCreate, request: Request):
                 pwd_hash, salt = hash_student_password("MemberPass@" + pass_id[-6:])
                 cursor.execute("""
                 INSERT OR IGNORE INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'ACTIVE', ?);
-                """, (verified_stu_id, existing["name"], existing["email"], existing["roll_no"], existing["dept"], pwd_hash, salt, existing["created_at"], existing["created_at"]))
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', 'ACTIVE', ?);
+                """, (verified_stu_id, existing["name"], existing["email"], existing["roll_no"], existing["dept"], pwd_hash, salt, existing["created_at"]))
 
             return {
                 "pass_id": pass_id,
@@ -3809,8 +3789,7 @@ async def create_membership(data: MembershipCreate, request: Request):
                 "message": f"Welcome back, {existing['name']}! Your official Digi-Pass was loaded from the database."
             }
 
-        # The verified token was consumed before the existing-member lookup above.
-        is_verified = 1
+        is_verified = 0
 
         # 3. Generate unique Pass ID
         unique_hex = secrets.token_hex(3).upper()
@@ -3840,8 +3819,8 @@ async def create_membership(data: MembershipCreate, request: Request):
             pwd_hash, salt = hash_student_password("MemberPass@" + unique_hex)
             cursor.execute("""
             INSERT OR IGNORE INTO registered_students (student_id, full_name, email, roll_no, dept, password_hash, password_salt, is_email_verified, email_verified_at, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?);
-            """, (verified_stu_id, name, email, roll, dept, pwd_hash, salt, is_verified, created_at, created_at))
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', 'ACTIVE', ?);
+            """, (verified_stu_id, name, email, roll, dept, pwd_hash, salt, created_at))
 
         log_audit_event("MEMBER_REGISTERED", ip, f"Registered {name} ({roll}) in {assoc} [Gmail: {email}] [Pass: {pass_id}] [Student ID: {verified_stu_id}]", conn=conn)
 

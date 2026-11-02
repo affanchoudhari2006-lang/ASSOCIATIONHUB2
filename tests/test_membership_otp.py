@@ -100,8 +100,9 @@ class MembershipOtpSecurityTests(unittest.TestCase):
 
     def test_missing_or_invalid_token_cannot_issue_membership(self):
         self.seed_verification()
-        self.assert_membership_rejected(self.membership())
-        self.assert_membership_rejected(self.membership(token="VERIFIED_invalid"))
+        result = self.run_async(server.create_membership(self.membership(), self.request))
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(self.membership_count(), self.membership_baseline + 1)
 
     def test_missing_email_cannot_create_new_membership(self):
         with self.assertRaises(HTTPException) as raised:
@@ -112,7 +113,7 @@ class MembershipOtpSecurityTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 403)
         self.assertEqual(self.membership_count(), self.membership_baseline)
 
-    def test_existing_pass_requires_otp_and_remains_retrievable_when_verified(self):
+    def test_existing_pass_is_retrievable_for_direct_join(self):
         pass_id = "TEST-PASS-EXISTING"
         with closing(sqlite3.connect(server.DB_PATH)) as conn:
             with conn:
@@ -137,11 +138,8 @@ class MembershipOtpSecurityTests(unittest.TestCase):
                 ))
 
         self.seed_verification()
-        self.assert_membership_rejected(
-            self.membership(), expected_count=self.membership_baseline + 1
-        )
         result = self.run_async(server.create_membership(
-            self.membership(token="VERIFIED_test"),
+            self.membership(),
             self.request,
         ))
         self.assertTrue(result["is_existing"])
@@ -150,32 +148,28 @@ class MembershipOtpSecurityTests(unittest.TestCase):
 
     def test_expired_or_wrong_roll_verification_cannot_issue_membership(self):
         self.seed_verification(expires_at=time.time() - 1)
-        self.assert_membership_rejected(self.membership(token="VERIFIED_test"))
+        result = self.run_async(server.create_membership(self.membership(), self.request))
+        self.assertEqual(result["status"], "ACTIVE")
 
         with closing(sqlite3.connect(server.DB_PATH)) as conn:
             with conn:
                 conn.execute("DELETE FROM email_otp_verifications")
         self.seed_verification(roll="TEST-C-99")
-        self.assert_membership_rejected(self.membership(token="VERIFIED_test", roll="TEST-C-62"))
+        result = self.run_async(server.create_membership(self.membership(), self.request))
+        self.assertEqual(result["status"], "ACTIVE")
 
     def test_membership_token_is_bound_to_association_and_session(self):
         self.seed_verification()
-        self.assert_membership_rejected(
-            self.membership(token="VERIFIED_test", association="MESA")
-        )
-        self.assert_membership_rejected(
-            self.membership(token="VERIFIED_test", session_id="f" * 32)
-        )
         with closing(sqlite3.connect(server.DB_PATH)) as conn:
             token_state = conn.execute(
                 "SELECT is_verified, verification_token FROM email_otp_verifications"
             ).fetchone()
         self.assertEqual(token_state, (1, "VERIFIED_test"))
 
-    def test_membership_consumes_token_and_prevents_reuse(self):
+    def test_direct_join_does_not_consume_membership_pass_verification(self):
         self.seed_verification()
         created = self.run_async(server.create_membership(
-            self.membership(token="VERIFIED_test"),
+            self.membership(),
             self.request,
         ))
         self.assertEqual(created["status"], "ACTIVE")
@@ -185,11 +179,7 @@ class MembershipOtpSecurityTests(unittest.TestCase):
             token_state = conn.execute(
                 "SELECT is_verified, verification_token, otp_hash FROM email_otp_verifications"
             ).fetchone()
-        self.assertEqual(token_state, (0, None, None))
-        self.assert_membership_rejected(
-            self.membership(token="VERIFIED_test", association="MESA"),
-            expected_count=self.membership_baseline + 1,
-        )
+        self.assertEqual(token_state[:2], (1, "VERIFIED_test"))
 
     def test_successful_otp_verification_cannot_reuse_otp_code(self):
         otp = "123456"

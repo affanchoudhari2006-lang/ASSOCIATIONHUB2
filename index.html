@@ -746,17 +746,17 @@
         </div>
         <h2 class="section-title">Campus Pulse: Student Experiences</h2>
         <p class="section-subtitle">
-          Real placement interview insights, hackathon survival tips, club life reviews, and technical project advice shared by verified NKOCET engineering students.
+          Real placement interview insights, hackathon survival tips, club life reviews, and technical project advice shared by NKOCET engineering students.
         </p>
       </div>
 
-      <!-- STATE 1: GATED VERIFICATION LOCK SCREEN (Shown if student is unverified) -->
+      <!-- STATE 1: COMMUNITY JOIN SCREEN -->
       <div id="chat-gateway-locked" style="background: radial-gradient(circle at 50% 0%, rgba(229, 169, 60, 0.08) 0%, rgba(8, 10, 15, 0.95) 75%); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-lg); padding: 2.25rem 1.75rem; max-width: 650px; margin: 0 auto; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6); text-align: center;">
         <div style="width: 56px; height: 56px; margin: 0 auto 1rem; border-radius: 50%; background: rgba(229, 169, 60, 0.12); border: 1px solid var(--brand-gold); display: flex; align-items: center; justify-content: center; font-size: 1.6rem;">
-          🔐
+          💬
         </div>
         <h3 style="color: #FFFFFF; font-size: 1.35rem; font-weight: 800; margin-bottom: 0.4rem; letter-spacing: -0.01em;">
-          NKOCET Verified Student Chat Gateway
+          NKOCET Student Community Gateway
         </h3>
         <p style="color: var(--color-text-muted); font-size: 0.88rem; line-height: 1.55; margin-bottom: 1.5rem; max-width: 520px; margin-left: auto; margin-right: auto;">
           Enter your student identity to join Campus Pulse community discussions across all 6 engineering departments.
@@ -812,7 +812,7 @@
             </span>
             <span id="chat-user-roll" style="font-size: 0.75rem; font-family: var(--font-mono); background: rgba(255, 255, 255, 0.08); padding: 0.15rem 0.5rem; border-radius: 4px; color: var(--color-text-secondary);">C-62</span>
             <span id="chat-user-dept" style="font-size: 0.75rem; color: var(--accent-csesa);">CSESA</span>
-            <span id="chat-user-status" class="admin-badge admin-badge-status-active" style="font-size: 0.68rem;">VERIFIED</span>
+            <span id="chat-user-status" class="admin-badge admin-badge-status-active" style="font-size: 0.68rem;">ACTIVE</span>
           </div>
 
           <div style="display: flex; align-items: center; gap: 0.6rem;">
@@ -1047,39 +1047,6 @@
             <div class="form-group">
               <label for="member-roll" class="form-label">Roll No / PRN *</label>
               <input type="text" id="member-roll" class="form-input" placeholder="e.g. C-62 or EN2024..." required>
-            </div>
-          </div>
-
-          <!-- Official Student Gmail & OTP Verification Gate -->
-          <div class="form-group" style="background: rgba(13, 18, 32, 0.45); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-sm); padding: 0.85rem; margin-bottom: 1rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; flex-wrap: wrap; gap: 0.25rem;">
-              <label for="member-email" class="form-label" style="margin-bottom: 0;">
-                <span>Official Student Gmail *</span>
-                <span style="font-size: 0.72rem; color: var(--brand-gold); margin-left: 0.35rem;">(Admin-Confidential)</span>
-              </label>
-              <span id="email-verify-status" style="font-size: 0.76rem; color: #19D68C; font-weight: 600;">🔐 Gmail OTP required for new passes</span>
-            </div>
-            
-            <div style="display: flex; gap: 0.5rem; align-items: center;">
-              <input type="email" id="member-email" class="form-input" placeholder="e.g. yourname@gmail.com (required for new passes)" style="flex: 1;">
-              <button type="button" id="btn-send-otp" class="btn-secondary" onclick="sendGmailOtp()" style="padding: 0.5rem 0.95rem; font-size: 0.8rem; white-space: nowrap;">
-                <span>Send OTP ✉️</span>
-              </button>
-            </div>
-
-            <!-- OTP Input Box (Revealed when Send OTP clicked) -->
-            <div id="otp-entry-wrap" style="display: none; margin-top: 0.65rem; padding-top: 0.65rem; border-top: 1px dashed var(--color-border-subtle);">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem; font-size: 0.76rem;">
-                <span style="color: var(--color-text-secondary);">Enter 6-digit verification code sent to Gmail:</span>
-                <span id="otp-timer" style="color: var(--brand-gold); font-family: var(--font-mono); font-weight: 700;">10:00</span>
-              </div>
-              <div style="display: flex; gap: 0.5rem; align-items: center;">
-                <input type="text" id="member-otp" class="form-input" placeholder="6-Digit OTP" maxlength="6" style="letter-spacing: 0.22rem; font-family: var(--font-mono); text-align: center; max-width: 140px;" autocomplete="one-time-code">
-                <button type="button" id="btn-verify-otp" class="btn-primary" onclick="verifyGmailOtp()" style="padding: 0.5rem 1.1rem; font-size: 0.8rem;">
-                  <span>Verify Code ✓</span>
-                </button>
-              </div>
-              <div id="otp-hint-msg" style="display: none; margin-top: 0.35rem; font-size: 0.72rem; color: var(--brand-gold); font-family: var(--font-mono);"></div>
             </div>
           </div>
 
