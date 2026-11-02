@@ -9,9 +9,6 @@
    GLOBAL UNIVERSAL API CLIENT & PROTOCOL ROUTER (NKOCET 2026)
    -------------------------------------------------------------------------- */
 window.createVerificationSessionId = function() {
-  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-    return window.crypto.randomUUID();
-  }
   const bytes = new Uint8Array(24);
   window.crypto.getRandomValues(bytes);
   return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
@@ -31,7 +28,9 @@ window.processOfflineMembershipQueue = async function() {
         const res = await apiFetch('/api/memberships', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(item)
+          body: JSON.stringify({
+            ...item
+          })
         });
         if (!res.ok) {
           remaining.push(item);
