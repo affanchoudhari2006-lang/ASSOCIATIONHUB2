@@ -939,13 +939,25 @@ function initMembershipModal() {
       if (prevAlert) prevAlert.remove();
 
       // Validate required inputs
-      if (!name || !roll) {
+      if (!name || !roll || !email) {
         if (!name && nameInput) nameInput.style.borderColor = '#ff5252';
         if (!roll && rollInput) rollInput.style.borderColor = '#ff5252';
+        if (!email && emailInput) emailInput.style.borderColor = '#ff5252';
         const alertDiv = document.createElement('div');
         alertDiv.id = 'membership-alert';
         alertDiv.className = 'alert-banner alert-warning';
-        alertDiv.innerHTML = `<span>⚠️</span> <div><strong>Missing Information:</strong> Please provide your Full Name and Roll No / PRN to generate your official pass.</div>`;
+        alertDiv.innerHTML = `<span>⚠️</span> <div><strong>Missing Information:</strong> Please provide your Full Name, Roll No / PRN, and Official Student Gmail to generate your official pass.</div>`;
+        formWrap.insertBefore(alertDiv, form);
+        if (typeof playAudioTone === 'function') playAudioTone(260, 0.15, 'sawtooth');
+        return;
+      }
+
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        if (emailInput) emailInput.style.borderColor = '#ff5252';
+        const alertDiv = document.createElement('div');
+        alertDiv.id = 'membership-alert';
+        alertDiv.className = 'alert-banner alert-warning';
+        alertDiv.innerHTML = `<span>⚠️</span> <div><strong>Invalid Email:</strong> Please provide a valid student Gmail address (e.g. name@gmail.com).</div>`;
         formWrap.insertBefore(alertDiv, form);
         if (typeof playAudioTone === 'function') playAudioTone(260, 0.15, 'sawtooth');
         return;
@@ -953,6 +965,7 @@ function initMembershipModal() {
 
       if (nameInput) nameInput.style.borderColor = '';
       if (rollInput) rollInput.style.borderColor = '';
+      if (emailInput) emailInput.style.borderColor = '';
 
 
       // Submit Button Loading State
@@ -989,10 +1002,11 @@ function initMembershipModal() {
           alertDiv.className = 'alert-banner alert-error';
           alertDiv.style.background = 'rgba(255, 82, 82, 0.15)';
           alertDiv.style.borderColor = '#ff5252';
+          const isEmailIssue = (data.detail || '').toLowerCase().includes('email');
           alertDiv.innerHTML = `
             <div style="font-size: 1.25rem;">⛔</div>
             <div>
-              <strong style="color: #ff5252; display: block; margin-bottom: 0.35rem;">Account Restricted by Administrator</strong>
+              <strong style="color: #ff5252; display: block; margin-bottom: 0.35rem;">${isEmailIssue ? 'Email Address Required' : 'Account Restricted by Administrator'}</strong>
               <div style="font-size: 0.85rem; line-height: 1.45; color: #f8fafc;">
                 ${data.detail || 'Your Roll No / Email was restricted by the Department Administrator. An official Rejoin Approval Request has been logged for Administrator review. Please contact the Coordinator or check back once approved.'}
               </div>
